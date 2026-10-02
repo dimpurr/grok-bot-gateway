@@ -214,7 +214,8 @@
           "format": "date-time"
         },
         "reply": {
-          "type": "string"
+          "type": "string",
+          "description": "The relayed reply text. Gateways must write this field; callers should also accept a `text` field from files written by older gateway instructions."
         }
       }
     }
