@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "grok-bot-gateway/result@1",
+  "title": "Grok Bot gateway result and reply files",
+  "description": "Written by the gateway Bot to <outbox>/<request_id>.json (result) and <outbox>/<request_id>.reply.json (relayed reply), each written as .part then renamed.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/result"
+    },
+    {
+      "$ref": "#/$defs/reply"
+    }
+  ],
+  "$defs": {
+    "uuid4": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "result": {
+      "type": "object",
+      "required": [
+        "v",
+        "request_id",
+        "op",
+        "status",
+        "completed_at"
+      ],
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "request_id": {
+          "$ref": "#/$defs/uuid4"
+        },
+        "op": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "error"
+          ]
+        },
+        "completed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "result": {
+          "description": "Op-specific payload; null when status=error. anyOf (not oneOf): the last branch is a catch-all for ops or fields added later, so a known payload also matches it.",
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "title": "ping",
+              "type": "object",
+              "required": [
+                "pong"
+              ],
+              "properties": {
+                "pong": {
+                  "const": true
+                },
+                "gateway": {
+                  "type": "string"
+                }
+              }
+            },
+            {
+              "title": "list_agents",
+              "type": "object",
+              "required": [
+                "agents"
+              ],
+              "properties": {
+                "agents": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "id",
+                      "name"
+                    ],
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "title": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "title": "read_transcript",
+              "type": "object",
+              "required": [
+                "agent",
+                "lines"
+              ],
+              "properties": {
+                "agent": {
+                  "type": "string"
+                },
+                "lines": {
+                  "type": "array",
+                  "description": "Transcript entries oldest-first, passed through as the gateway Bot's transcript tool returned them. Observed 2026-10-03 for another agent: objects with seq, kind, timestampMs, requestId and message/content fields; treat the entry shape as tool-defined and version-unstable."
+                },
+                "positions": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "description": "Free-text position summary from the tool, e.g. '70-74 of 74'. Not guaranteed to use the same numbering as next_before."
+                },
+                "next_before": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "description": "Cursor to pass as `before` for the next older page (observed to equal the oldest returned entry's seq); null when nothing remains."
+                },
+                "truncated": {
+                  "type": "boolean"
+                }
+              }
+            },
+            {
+              "title": "send_message",
+              "type": "object",
+              "required": [
+                "delivered",
+                "agent"
+              ],
+              "properties": {
+                "delivered": {
+                  "type": "boolean"
+                },
+                "agent": {
+                  "type": "string"
+                },
+                "note": {
+                  "type": "string"
+                }
+              }
+            },
+            {
+              "type": "object"
+            }
+          ]
+        },
+        "error": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "required": [
+                "code",
+                "message"
+              ],
+              "properties": {
+                "code": {
+                  "enum": [
+                    "invalid_request",
+                    "unknown_op",
+                    "unknown_agent",
+                    "not_permitted",
+                    "tool_error",
+                    "too_large",
+                    "duplicate_request"
+                  ],
+                  "description": "Gateway may add codes; callers must treat unknown codes as errors."
+                },
+                "message": {
+                  "type": "string"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "reply": {
+      "type": "object",
+      "required": [
+        "v",
+        "request_id",
+        "from_agent",
+        "received_at",
+        "reply"
+      ],
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "request_id": {
+          "$ref": "#/$defs/uuid4"
+        },
+        "from_agent": {
+          "type": "string"
+        },
+        "received_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "reply": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

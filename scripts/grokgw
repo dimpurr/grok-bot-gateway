@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# grokgw — talk to a Grok Bot team through a webhook-triggered "gateway" Bot.
+#
+#   grokgw ping
+#   grokgw list
+#   grokgw read <agent> [--limit N] [--before N]
+#   grokgw send <agent> <message|-> [--priority] [--wait-reply]
+#   grokgw fetch <request_id> [--reply]
+# Global flags: --no-wait (print request_id only) · --timeout SECONDS (default 600)
+#               --caller TEXT · -h|--help
+#
+# Environment:
+#   GROKGW_WEBHOOK_URL      routine webhook URL ("POST to" field)          required for requests
+#   GROKGW_WEBHOOK_KEY      routine key (never printed)                     or GROKGW_WEBHOOK_KEY_CMD
+#   GROKGW_WEBHOOK_KEY_CMD  command printing the key, e.g.
+#                           'security find-generic-password -s grokgw -w'  (macOS Keychain)
+#   GROKGW_OUTBOX           outbox base URL, e.g. http://<gateway-host>:8787
+#                           (default http://127.0.0.1:8787, i.e. caller on the gateway's computer)
+#   GROKGW_OUTBOX_HOST      optional Host header for the outbox, only if a proxy in front of it
+#                           routes by host name (e.g. <machine>.<tailnet>.ts.net:8787)
+#   GROKGW_CALLER           default caller tag (default: grokgw@<hostname>)
+#   GROKGW_AUTH_HEADER      header name for the key (default Authorization, value "Bearer <key>")
+# Exit codes: 0 ok · 1 usage · 2 webhook rejected · 3 timeout · 4 result status=error · 5 dependency
+set -u
+
+OUTBOX="${GROKGW_OUTBOX:-http://127.0.0.1:8787}"; OUTBOX="${OUTBOX%/}"
+TIMEOUT=600; WAIT=1; WAIT_REPLY=0; REPLY=0; PRIORITY=false; LIMIT=""; BEFORE=""
+CALLER="${GROKGW_CALLER:-grokgw@$(hostname -s 2>/dev/null || echo unknown)}"
+
+die() { echo "grokgw: $1" >&2; exit "${2:-1}"; }
+usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1" 5; }
+need curl
+
+uuid4() {
+  local u=""
+  if [ -r /proc/sys/kernel/random/uuid ]; then u=$(cat /proc/sys/kernel/random/uuid)
+  elif command -v uuidgen >/dev/null 2>&1; then u=$(uuidgen)
+  elif command -v python3 >/dev/null 2>&1; then u=$(python3 -c 'import uuid;print(uuid.uuid4())')
+  else die "need /proc uuid, uuidgen or python3" 5; fi
+  printf '%s' "$u" | tr 'A-F' 'a-f'
+}
+is_uuid4() { printf '%s' "$1" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'; }
+
+# JSON string escaping without jq/python: backslash, quote, control chars.
+jstr() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json,sys;sys.stdout.write(json.dumps(sys.argv[1]))' "$1"
+  else
+    printf '%s' "$1" | awk 'BEGIN{ORS=""; print "\""} {gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); gsub(/\t/,"\\t"); gsub(/\r/,"\\r"); if (NR>1) print "\\n"; print} END{print "\""}'
+  fi
+}
+
+key() {
+  if [ -n "${GROKGW_WEBHOOK_KEY:-}" ]; then printf '%s' "$GROKGW_WEBHOOK_KEY"
+  elif [ -n "${GROKGW_WEBHOOK_KEY_CMD:-}" ]; then sh -c "$GROKGW_WEBHOOK_KEY_CMD" | tr -d '\r\n'
+  else die "set GROKGW_WEBHOOK_KEY or GROKGW_WEBHOOK_KEY_CMD"; fi
+}
+
+outbox_get() { # $1 = file name; body to stdout; prints http code to fd 3
+  local hdr=()
+  [ -n "${GROKGW_OUTBOX_HOST:-}" ] && hdr=(-H "Host: $GROKGW_OUTBOX_HOST")
+  curl -sS -m 20 ${hdr[@]+"${hdr[@]}"} -w '\n%{http_code}' "$OUTBOX/$1"
+}
+
+outbox_note() { [ -n "${GROKGW_OUTBOX:-}" ] || echo "grokgw: GROKGW_OUTBOX not set; using $OUTBOX" >&2; }
+
+poll() { # $1 = file name; waits up to TIMEOUT; prints body
+  local start now out code body delay=2
+  outbox_note
+  start=$(date +%s)
+  while :; do
+    out=$(outbox_get "$1" 2>/dev/null) || out=$'\n000'
+    code=${out##*$'\n'}; body=${out%$'\n'*}
+    if [ "$code" = 200 ]; then printf '%s\n' "$body"; return 0; fi
+    now=$(date +%s)
+    if [ $((now - start)) -ge "$TIMEOUT" ]; then
+      echo "grokgw: timed out after ${TIMEOUT}s waiting for $1 (last HTTP $code). Fetch later: grokgw fetch ${1%%.*}" >&2
+      return 3
+    fi
+    sleep "$delay"; delay=$(( delay < 30 ? delay * 3 / 2 + 1 : 30 ))
+  done
+}
+
+status_of() { # prints status field of a result JSON
+  printf '%s' "$1" | grep -o '"status"[[:space:]]*:[[:space:]]*"[a-z]*"' | head -1 | sed 's/.*"\([a-z]*\)"$/\1/'
+}
+
+post() { # $1 = JSON body
+  [ -n "${GROKGW_WEBHOOK_URL:-}" ] || die "set GROKGW_WEBHOOK_URL"
+  local hname="${GROKGW_AUTH_HEADER:-Authorization}" k code
+  k=$(key) || exit 1
+  [ -n "$k" ] || die "webhook key is empty"
+  # Header comes from stdin (-H @-) so the key never appears in argv / ps.
+  code=$(printf '%s: Bearer %s\n' "$hname" "$k" | curl -s -m 30 -o /dev/null -w '%{http_code}' \
+          -X POST -H @- -H 'Content-Type: application/json' --data-binary "$1" "$GROKGW_WEBHOOK_URL" 2>/dev/null) || code=000  # quiet: curl errors can echo the URL
+  unset k
+  [ "$code" = 200 ] || die "webhook returned HTTP $code (run not started: check URL, key, routine paused?)" 2
+}
+
+# ---- parse
+[ $# -ge 1 ] || usage 1
+CMD="$1"; shift
+case "$CMD" in -h|--help|help) usage 0 ;; esac
+ARGS=()
+set +u  # bash 3.2 (macOS) treats empty arrays as unset
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --limit) LIMIT="${2:-}"; shift 2 ;;
+    --before) BEFORE="${2:-}"; shift 2 ;;
+    --priority) PRIORITY=true; shift ;;
+    --no-wait) WAIT=0; shift ;;
+    --wait-reply) WAIT_REPLY=1; shift ;;
+    --reply) REPLY=1; shift ;;
+    --timeout) TIMEOUT="${2:-}"; shift 2 ;;
+    --caller) CALLER="${2:-}"; shift 2 ;;
+    -h|--help) usage 0 ;;
+    --) shift; while [ $# -gt 0 ]; do ARGS+=("$1"); shift; done ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+case "$TIMEOUT" in ''|*[!0-9]*) die "--timeout must be seconds" ;; esac
+for n in "$LIMIT" "$BEFORE"; do case "$n" in ''|*[!0-9]*) [ -z "$n" ] || die "--limit/--before must be non-negative integers" ;; esac; done
+if [ -n "$LIMIT" ] && { [ "$LIMIT" -lt 1 ] || [ "$LIMIT" -gt 200 ]; }; then die "--limit must be 1..200"; fi
+
+if [ "$CMD" = fetch ]; then
+  [ ${#ARGS[@]} -eq 1 ] && is_uuid4 "${ARGS[0]}" || die "usage: grokgw fetch <request_id uuidv4> [--reply]"
+  f="${ARGS[0]}$([ $REPLY = 1 ] && echo .reply).json"
+  if [ $WAIT = 1 ]; then body=$(poll "$f") || exit $?; else
+    outbox_note; out=$(outbox_get "$f") || exit 1; code=${out##*$'\n'}; body=${out%$'\n'*}; [ "$code" = 200 ] || die "not ready (HTTP $code)" 3; fi
+  printf '%s\n' "$body"; [ "$(status_of "$body")" = error ] && exit 4; exit 0
+fi
+
+RID=$(uuid4)
+base="\"v\":1,\"request_id\":\"$RID\",\"caller\":$(jstr "$CALLER")"
+case "$CMD" in
+  ping) [ ${#ARGS[@]} -eq 0 ] || usage 1; BODY="{$base,\"op\":\"ping\"}" ;;
+  list) [ ${#ARGS[@]} -eq 0 ] || usage 1; BODY="{$base,\"op\":\"list_agents\"}" ;;
+  read)
+    [ ${#ARGS[@]} -eq 1 ] || die "usage: grokgw read <agent> [--limit N] [--before N]"
+    BODY="{$base,\"op\":\"read_transcript\",\"agent\":$(jstr "${ARGS[0]}"),\"limit\":${LIMIT:-50}${BEFORE:+,\"before\":$BEFORE}}" ;;
+  send)
+    [ ${#ARGS[@]} -eq 2 ] || die "usage: grokgw send <agent> <message|-> [--priority] [--wait-reply]"
+    MSG="${ARGS[1]}"; [ "$MSG" = - ] && MSG=$(cat)
+    [ -n "$MSG" ] || die "empty message"
+    BODY="{$base,\"op\":\"send_message\",\"agent\":$(jstr "${ARGS[0]}"),\"message\":$(jstr "$MSG"),\"priority\":$PRIORITY}" ;;
+  *) usage 1 ;;
+esac
+
+post "$BODY"
+if [ $WAIT = 0 ]; then echo "$RID"; exit 0; fi
+echo "grokgw: accepted request_id=$RID; waiting for result (timeout ${TIMEOUT}s)…" >&2
+res=$(poll "$RID.json") || exit $?
+printf '%s\n' "$res"
+st=$(status_of "$res")
+if [ "$CMD" = send ] && [ $WAIT_REPLY = 1 ] && [ "$st" = ok ]; then
+  echo "grokgw: waiting for reply…" >&2
+  poll "$RID.reply.json" || exit $?
+fi
+[ "$st" = error ] && exit 4
+exit 0

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "grok-bot-gateway/request@1",
+  "title": "Grok Bot gateway request (webhook POST body)",
+  "description": "Sent by a caller as the JSON body of an HTTP POST to the gateway routine's webhook URL, with header `Authorization: Bearer <key>`. The gateway Bot treats every field as untrusted data.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "request_id", "op"],
+  "properties": {
+    "v": {"const": 1},
+    "request_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "Caller-generated lowercase UUIDv4. Doubles as the capability to fetch the result, so it must come from a CSPRNG and never be reused."
+    },
+    "op": {"enum": ["ping", "list_agents", "read_transcript", "send_message"]},
+    "agent": {"type": "string", "minLength": 1, "maxLength": 200, "description": "Target agent id (preferred) or exact name. Required for read_transcript and send_message."},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50, "description": "read_transcript: max lines to return (newest page)."},
+    "before": {"type": "integer", "minimum": 0, "description": "read_transcript: page back from this position (exclusive), as returned in a previous result's `next_before`."},
+    "message": {"type": "string", "minLength": 1, "maxLength": 8000, "description": "send_message: text to relay. Relayed as data, tagged with request_id and caller."},
+    "priority": {"type": "boolean", "default": false, "description": "send_message: ask the gateway to relay with priority where supported."},
+    "caller": {"type": "string", "maxLength": 200, "description": "Free-text tag identifying the caller, e.g. claude-code@laptop/project. Informational, not authentication."}
+  },
+  "allOf": [
+    {"if": {"properties": {"op": {"enum": ["read_transcript", "send_message"]}}}, "then": {"required": ["agent"]}},
+    {"if": {"properties": {"op": {"const": "send_message"}}}, "then": {"required": ["message"]}}
+  ]
+}
