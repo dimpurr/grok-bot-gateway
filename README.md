@@ -62,10 +62,12 @@ Create a gateway Bot and a webhook routine, copy the host scripts to its compute
 ## Limitations
 
 - Each request runs the Bot and takes tens of seconds to minutes; every call spends the account's Grok Bot usage.
+- `read` is handed from the routine run to the gateway Bot itself, so it is the slowest operation (minutes) and needs that Bot to be reachable.
+- `ask` and `send --wait-reply` relay with priority so the target Bot wakes now; plain `send` is read on the target's next turn.
 - The hourly cap applies only on each client machine. One webhook key grants access to every Bot and has no per-caller scopes.
 - Host-side operation and prompt-injection checks depend on the gateway Bot following its persona and routine instructions. The delivery script enforces the return allowlist when used, but a misbehaving Bot could try to contact a destination itself.
 - Setup requires creating the Bot and routine and configuring the host; `tailnet` and `tunnel` also require an outbox server.
-- Relayed replies depend on the target Bot replying and the gateway writing the reply file. The reply path is not verified end to end; waits can time out.
+- Relayed replies depend on the target Bot replying and the gateway writing the reply file; verified end to end once, and waits can still time out.
 - Transcript entry fields are passed through and may change.
 - Use through Cursor must follow Cursor's terms.
 
