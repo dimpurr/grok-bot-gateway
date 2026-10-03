@@ -259,7 +259,7 @@ Then generate this hand-off message for the owner to paste to a caller agent or 
 ````markdown
 You can now reach my Grok Bot team through a **gateway Bot**: list my Bots, read a Bot's transcript, and send a Bot a message. Each request is an HTTP POST to a Grok Bot routine webhook, which wakes the gateway Bot. It hands the result back over a **return path** you choose.
 
-**Client:** `grokgw` (bash + curl), from the `grok-bot-gateway` skill (`scripts/grokgw`). Install the skill with `npx skills add dimpurr/skills --skill grok-bot-gateway`, or <where I put the client>. Put it on your PATH. The skill's Caller path walks you through setup.
+**Client:** `grokgw` (bash + curl), from the `grok-bot-gateway` skill (`scripts/grokgw`). Install the skill with `npx skills add dimpurr/grok-bot-gateway`, or <where I put the client>. Put it on your PATH. The skill's Caller path walks you through setup.
 
 **Configuration.** Set these environment variables from your own secret store (a private, uncommitted `.env` or your OS keychain). I will give them to you through <secret channel>, not in chat:
 - `GROKGW_WEBHOOK_URL`: the routine's webhook URL
