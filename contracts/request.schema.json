@@ -15,11 +15,38 @@
     },
     "op": {"enum": ["ping", "list_agents", "read_transcript", "send_message"]},
     "agent": {"type": "string", "minLength": 1, "maxLength": 200, "description": "Target agent id (preferred) or exact name. Required for read_transcript and send_message."},
-    "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50, "description": "read_transcript: max lines to return (newest page)."},
+    "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20, "description": "read_transcript: max lines to return (newest page)."},
     "before": {"type": "integer", "minimum": 0, "description": "read_transcript: page back from this position (exclusive), as returned in a previous result's `next_before`."},
     "message": {"type": "string", "minLength": 1, "maxLength": 8000, "description": "send_message: text to relay. Relayed as data, tagged with request_id and caller."},
     "priority": {"type": "boolean", "default": false, "description": "send_message: ask the gateway to relay with priority where supported."},
-    "caller": {"type": "string", "maxLength": 200, "description": "Free-text tag identifying the caller, e.g. claude-code@laptop/project. Informational, not authentication."}
+    "caller": {"type": "string", "maxLength": 200, "description": "Free-text tag identifying the caller, e.g. claude-code@laptop/project. Informational, not authentication."},
+    "return": {
+      "description": "Where the gateway should deliver the result and any reply. Optional: absent means a legacy v0.2 client and the host decides via its legacy_no_return setting. A caller must not be able to make the Bot send transcripts to an arbitrary destination, so the host validates this against its own allowlist before doing anything.",
+      "oneOf": [
+        {"type": "object", "required": ["mode"], "additionalProperties": false, "properties": {"mode": {"const": "none"}}},
+        {"type": "object", "required": ["mode"], "additionalProperties": false, "properties": {"mode": {"const": "tailnet"}}},
+        {"type": "object", "required": ["mode"], "additionalProperties": false, "properties": {"mode": {"const": "tunnel"}}},
+        {
+          "type": "object",
+          "required": ["mode", "repo"],
+          "additionalProperties": false,
+          "properties": {
+            "mode": {"const": "github"},
+            "repo": {"type": "string", "pattern": "^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$", "description": "owner/name of a repo the host allows."}
+          }
+        },
+        {
+          "type": "object",
+          "required": ["mode", "url", "secret"],
+          "additionalProperties": false,
+          "properties": {
+            "mode": {"const": "callback"},
+            "url": {"type": "string", "pattern": "^https://", "maxLength": 500},
+            "secret": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Per-request HMAC secret the client generated."}
+          }
+        }
+      ]
+    }
   },
   "allOf": [
     {"if": {"properties": {"op": {"enum": ["read_transcript", "send_message"]}}}, "then": {"required": ["agent"]}},

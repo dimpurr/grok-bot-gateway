@@ -12,6 +12,12 @@
 #   GROKGW_OUTBOX_DIR  outbox directory (default $GROKGW_HOME/outbox); must match the
 #                      <OUTBOX_DIR> in the routine's saved instruction
 #   GROKGW_PORT        port (default 8787)
+#   GROKGW_OUTBOX_TOKEN / GROKGW_OUTBOX_TOKEN_FILE
+#                      tunnel mode only: if set, every request must send
+#                      `Authorization: Bearer <token>`. For tunnel mode you run
+#                      e.g. `cloudflared tunnel --url http://127.0.0.1:8787`
+#                      yourself and MUST set a token; the port is then exposed
+#                      on the public internet.
 # Without Tailscale (no tailnet IPv4) it serves loopback only.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -51,7 +57,9 @@ if healthy && { [ -z "$TSIP" ] || healthy "$TSIP"; }; then
   echo "server: already healthy on 127.0.0.1:$PORT"
 else
   stop_server
-  GROKGW_BIND="$BIND" GROKGW_PORT="$PORT" GROKGW_OUTBOX_DIR="$OUTBOX_DIR" setsid nohup python3 "$SERVER" >>"$LOG" 2>&1 </dev/null 3>&- 4>&- 5>&- &
+  GROKGW_BIND="$BIND" GROKGW_PORT="$PORT" GROKGW_OUTBOX_DIR="$OUTBOX_DIR" \
+  GROKGW_OUTBOX_TOKEN="${GROKGW_OUTBOX_TOKEN:-}" GROKGW_OUTBOX_TOKEN_FILE="${GROKGW_OUTBOX_TOKEN_FILE:-}" \
+  setsid nohup python3 "$SERVER" >>"$LOG" 2>&1 </dev/null 3>&- 4>&- 5>&- &
   echo $! >"$PIDF"
   for _ in 1 2 3 4 5 6 7 8 9 10; do healthy && break; sleep 0.3; done
   if healthy; then echo "server: started pid $(cat "$PIDF")"; else echo "server: FAILED to start; see $LOG" >&2; exit 1; fi

@@ -1,0 +1,14 @@
+{
+  "allowed_returns": ["none", "tailnet"],
+  "outbox_dir": "/workspace/gateway/outbox",
+  "github": {
+    "repos": {
+      "owner/gateway-results": {"path": "outbox", "branch": "main"}
+    },
+    "token_file": "/workspace/gateway/github-token"
+  },
+  "callback": {
+    "hosts": ["hooks.example.com"]
+  },
+  "legacy_no_return": "tailnet"
+}

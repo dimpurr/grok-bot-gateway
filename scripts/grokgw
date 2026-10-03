@@ -17,13 +17,28 @@
 #   GROKGW_WEBHOOK_KEY      routine key (never printed)                     or GROKGW_WEBHOOK_KEY_CMD
 #   GROKGW_WEBHOOK_KEY_CMD  command printing the key, e.g.
 #                           'security find-generic-password -s grokgw -w'  (macOS Keychain)
-#   GROKGW_OUTBOX           outbox base URL, e.g. http://<gateway-host>:8787
-#                           (default http://127.0.0.1:8787, i.e. caller on the gateway's computer)
-#   GROKGW_OUTBOX_HOST      optional Host header for the outbox, only if a proxy in front of it
-#                           routes by host name (e.g. <machine>.<tailnet>.ts.net:8787)
+#   GROKGW_RETURN           how results come back: none|tailnet|tunnel|github|callback (default none)
+#                           none is fire-and-forget; list/read/ask/fetch and send --wait-reply need one
 #   GROKGW_CALLER           default caller tag (default: grokgw@<hostname>)
 #   GROKGW_AUTH_HEADER      header name for the key (default Authorization, value "Bearer <key>")
 #   GROKGW_POST_TIMEOUT     POST timeout in seconds (default 30)
+#
+# Return-path settings (only the ones for your GROKGW_RETURN mode are read):
+#   tailnet/tunnel:
+#   GROKGW_OUTBOX           outbox base URL, e.g. http://<gateway-host>:8787 (tailnet) or
+#                           https://<public-host> (tunnel; must be https)
+#   GROKGW_OUTBOX_HOST      optional Host header, only if a proxy routes by host name
+#   GROKGW_OUTBOX_TOKEN     tunnel: outbox bearer token (never printed)      or GROKGW_OUTBOX_TOKEN_CMD
+#   github:
+#   GROKGW_GITHUB_REPO      owner/name of the results repo (required)
+#   GROKGW_GITHUB_PATH      directory in the repo (default outbox)
+#   GROKGW_GITHUB_REF       branch or ref (default main)
+#   GROKGW_GITHUB_TOKEN     read-only token (never printed)                  or GROKGW_GITHUB_TOKEN_CMD
+#   GROKGW_GITHUB_API       API base (default https://api.github.com; tests use a mock)
+#   callback:
+#   GROKGW_CALLBACK_URL     public https URL of your receiver (required)
+#   GROKGW_CALLBACK_DIR     local dir the receiver writes (default $GROKGW_STATE_DIR/callback)
+#
 #   GROKGW_STATE_DIR        client state dir (default ${XDG_STATE_HOME:-$HOME/.local/state}/grokgw)
 #   GROKGW_MAX_PER_HOUR     hourly cap on webhook POSTs (default 12; 0 = no cap)
 #   GROKGW_DISABLED         non-empty and not "0" (or the file $GROKGW_STATE_DIR/disabled)
@@ -42,6 +57,10 @@ REPLY_TIMEOUT=900; JSONOUT=0
 CALLER="${GROKGW_CALLER:-grokgw@$(hostname -s 2>/dev/null || echo unknown)}"
 STATE_DIR="${GROKGW_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/grokgw}"
 CALLS="$STATE_DIR/calls"; LOCK="$STATE_DIR/lock"
+RETURN="${GROKGW_RETURN:-none}"
+GITHUB_REPO="${GROKGW_GITHUB_REPO:-}"; GITHUB_PATH="${GROKGW_GITHUB_PATH:-outbox}"
+GITHUB_REF="${GROKGW_GITHUB_REF:-main}"; GITHUB_API="${GROKGW_GITHUB_API:-https://api.github.com}"
+CALLBACK_URL="${GROKGW_CALLBACK_URL:-}"; CALLBACK_DIR="${GROKGW_CALLBACK_DIR:-$STATE_DIR/callback}"
 
 die() { echo "grokgw: $1" >&2; exit "${2:-1}"; }
 usage() { awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit "${1:-0}"; }
@@ -128,21 +147,68 @@ record_call() { # append one ledger line for a POST that started or had an unkno
   date +%s >>"$CALLS" 2>/dev/null || true
   lock_release
 }
-
-outbox_get() { # $1 = file name; body to stdout; prints http code to fd 3
-  local hdr=()
-  [ -n "${GROKGW_OUTBOX_HOST:-}" ] && hdr=(-H "Host: $GROKGW_OUTBOX_HOST")
-  curl -sS -m 20 ${hdr[@]+"${hdr[@]}"} -w '\n%{http_code}' "$OUTBOX/$1"
+require_return() { # $1 = command label; exit 7 in none mode (no way to read anything back)
+  if [ "$RETURN" = none ]; then
+    die "$1 needs a return path; set GROKGW_RETURN (github|callback|tunnel|tailnet). See the skill's 'Return paths' section." 7
+  fi
+  return 0
 }
 
-outbox_note() { [ -n "${GROKGW_OUTBOX:-}" ] || echo "grokgw: GROKGW_OUTBOX not set; using $OUTBOX" >&2; }
+# ---- return-path tokens (read-only; values never printed)
+outbox_token() {
+  if [ -n "${GROKGW_OUTBOX_TOKEN:-}" ]; then printf '%s' "$GROKGW_OUTBOX_TOKEN"
+  elif [ -n "${GROKGW_OUTBOX_TOKEN_CMD:-}" ]; then sh -c "$GROKGW_OUTBOX_TOKEN_CMD" | tr -d '\r\n'
+  else die "tunnel mode needs GROKGW_OUTBOX_TOKEN or GROKGW_OUTBOX_TOKEN_CMD" 1; fi
+}
+github_token() {
+  if [ -n "${GROKGW_GITHUB_TOKEN:-}" ]; then printf '%s' "$GROKGW_GITHUB_TOKEN"
+  elif [ -n "${GROKGW_GITHUB_TOKEN_CMD:-}" ]; then sh -c "$GROKGW_GITHUB_TOKEN_CMD" | tr -d '\r\n'
+  else die "github mode needs GROKGW_GITHUB_TOKEN or GROKGW_GITHUB_TOKEN_CMD" 1; fi
+}
+gen_secret() { # 32 random bytes as 64 lowercase hex chars
+  if [ -r /dev/urandom ] && command -v od >/dev/null 2>&1; then
+    od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import secrets;print(secrets.token_hex(32))'
+  else die "cannot generate a callback secret (need /dev/urandom+od or python3)" 5; fi
+}
+
+# ---- fetch_file <name>: the one place that reads a result/reply back. Prints the body then a
+#      final line with an HTTP-ish code: 200 found / 404 not yet / 000 or other = error.
+fetch_file() {
+  local hdr=() tok
+  case "$RETURN" in
+    tailnet)
+      [ -n "${GROKGW_OUTBOX_HOST:-}" ] && hdr=(-H "Host: $GROKGW_OUTBOX_HOST")
+      curl -sS -m 20 ${hdr[@]+"${hdr[@]}"} -w '\n%{http_code}' "$OUTBOX/$1" ;;
+    tunnel)
+      [ -n "${GROKGW_OUTBOX_HOST:-}" ] && hdr=(-H "Host: $GROKGW_OUTBOX_HOST")
+      tok=$(outbox_token) || { printf '\n000'; return 0; }
+      printf 'Authorization: Bearer %s\n' "$tok" | curl -sS -m 20 \
+        ${hdr[@]+"${hdr[@]}"} -H @- -w '\n%{http_code}' "$OUTBOX/$1" ;;
+    github)
+      tok=$(github_token) || { printf '\n000'; return 0; }
+      printf 'Authorization: Bearer %s\n' "$tok" | curl -sS -m 20 -H @- \
+        -H 'Accept: application/vnd.github.raw' -w '\n%{http_code}' \
+        "$GITHUB_API/repos/$GITHUB_REPO/contents/$GITHUB_PATH/$1?ref=$GITHUB_REF" ;;
+    callback)
+      if [ -f "$CALLBACK_DIR/$1" ]; then printf '%s\n200' "$(cat "$CALLBACK_DIR/$1")"; else printf '\n404'; fi ;;
+    *) printf '\n000' ;;
+  esac
+}
+
+return_note() {
+  case "$RETURN" in
+    tailnet) [ -n "${GROKGW_OUTBOX:-}" ] || echo "grokgw: GROKGW_OUTBOX not set; using $OUTBOX" >&2 ;;
+  esac
+}
 
 poll() { # $1 = file name, $2 = timeout seconds (default TIMEOUT); prints body
   local to="${2:-$TIMEOUT}" start now out code body delay=2 hint
-  outbox_note
+  return_note
   start=$(date +%s)
   while :; do
-    out=$(outbox_get "$1" 2>/dev/null) || out=$'\n000'
+    out=$(fetch_file "$1" 2>/dev/null) || out=$'\n000'
     code=${out##*$'\n'}; body=${out%$'\n'*}
     if [ "$code" = 200 ]; then printf '%s\n' "$body"; return 0; fi
     now=$(date +%s)
@@ -203,7 +269,7 @@ pcheck() { printf '%-5s %s\n' "$1" "$2"; [ "$1" = FAIL ] && DOCTOR_FAIL=1; retur
 has() { command -v "$1" >/dev/null 2>&1; }
 
 doctor() {
-  local v u rest hostpart kv resp code hdrs
+  local v u rest hostpart kv resp code hdrs tok rbody
   if has curl; then
     v=$(curl --version 2>/dev/null | head -1 | awk '{print $2}')
     pcheck PASS "curl present${v:+ (version $v)}"
@@ -237,24 +303,88 @@ doctor() {
     pcheck FAIL "no webhook key (set GROKGW_WEBHOOK_KEY or GROKGW_WEBHOOK_KEY_CMD)"
   fi
 
-  if [ -z "${GROKGW_OUTBOX:-}" ]; then
-    pcheck INFO "GROKGW_OUTBOX not set (loopback default; only right on the gateway's computer)"
-  else
-    resp=$(curl -sS -m 20 -o /dev/null -D - -w '\n%{http_code}' \
-            "$OUTBOX/00000000-0000-4000-8000-000000000000.json" 2>/dev/null) || resp=$'\n000'
-    code=${resp##*$'\n'}; hdrs=${resp%$'\n'*}
-    if [ "$code" = 404 ]; then
-      if printf '%s' "$hdrs" | grep -qi '^Server: outbox'; then
-        pcheck PASS "outbox reachable and answers as outbox_server.py (404 + Server: outbox)"
+  pcheck INFO "return path: $RETURN"
+  case "$RETURN" in
+    none)
+      pcheck INFO "fire-and-forget: list/read/ask/fetch disabled" ;;
+    tailnet)
+      if [ -z "${GROKGW_OUTBOX:-}" ]; then
+        pcheck INFO "GROKGW_OUTBOX not set (loopback default; only right on the gateway's computer)"
       else
-        pcheck FAIL "something else answers at the outbox URL (404 without Server: outbox)"
-      fi
-    elif [ "$code" = 000 ]; then
-      pcheck FAIL "outbox unreachable (connection error)"
-    else
-      pcheck FAIL "unexpected outbox response (HTTP $code)"
-    fi
-  fi
+        resp=$(curl -sS -m 20 -o /dev/null -D - -w '\n%{http_code}' \
+                "$OUTBOX/00000000-0000-4000-8000-000000000000.json" 2>/dev/null) || resp=$'\n000'
+        code=${resp##*$'\n'}; hdrs=${resp%$'\n'*}
+        if [ "$code" = 404 ]; then
+          if printf '%s' "$hdrs" | grep -qi '^Server: outbox'; then
+            pcheck PASS "outbox reachable and answers as outbox_server.py (404 + Server: outbox)"
+          else
+            pcheck FAIL "something else answers at the outbox URL (404 without Server: outbox)"
+          fi
+        elif [ "$code" = 000 ]; then
+          pcheck FAIL "outbox unreachable (connection error)"
+        else
+          pcheck FAIL "unexpected outbox response (HTTP $code)"
+        fi
+      fi ;;
+    tunnel)
+      case "$OUTBOX" in https://*) pcheck PASS "tunnel outbox is https" ;; *) pcheck FAIL "tunnel mode needs GROKGW_OUTBOX to be https://" ;; esac
+      if [ -n "${GROKGW_OUTBOX_TOKEN:-}" ] || [ -n "${GROKGW_OUTBOX_TOKEN_CMD:-}" ]; then
+        tok=$(outbox_token 2>/dev/null)
+        if [ -n "$tok" ]; then pcheck PASS "tunnel outbox token set"
+        else pcheck FAIL "tunnel outbox token is empty"; fi
+        code=$(curl -sS -m 20 -o /dev/null -w '%{http_code}' "$OUTBOX/00000000-0000-4000-8000-000000000000.json" 2>/dev/null) || code=000
+        if [ "$code" = 401 ]; then pcheck PASS "outbox rejects unauthenticated GET (401)"
+        else pcheck FAIL "expected 401 for an unauthenticated outbox GET (got HTTP $code)"; fi
+        resp=$(printf 'Authorization: Bearer %s\n' "$tok" | curl -sS -m 20 -o /dev/null -D - -H @- -w '\n%{http_code}' \
+                "$OUTBOX/00000000-0000-4000-8000-000000000000.json" 2>/dev/null) || resp=$'\n000'
+        code=${resp##*$'\n'}; hdrs=${resp%$'\n'*}
+        if [ "$code" = 404 ] && printf '%s' "$hdrs" | grep -qi '^Server: outbox'; then
+          pcheck PASS "outbox answers as outbox_server.py with a token (404 + Server: outbox)"
+        else
+          pcheck FAIL "authenticated outbox GET unexpected (HTTP $code)"
+        fi
+      else
+        pcheck FAIL "tunnel mode needs GROKGW_OUTBOX_TOKEN or GROKGW_OUTBOX_TOKEN_CMD"
+      fi ;;
+    github)
+      case "$GITHUB_REPO" in
+        ''|/*) pcheck FAIL "github mode needs GROKGW_GITHUB_REPO=owner/name" ;;
+        */*) pcheck PASS "github repo configured" ;;
+        *) pcheck FAIL "GROKGW_GITHUB_REPO must be owner/name" ;;
+      esac
+      if [ -n "$GITHUB_REPO" ]; then
+        tok=$(github_token 2>/dev/null)
+        if [ -n "$tok" ]; then
+          resp=$(printf 'Authorization: Bearer %s\n' "$tok" | curl -sS -m 20 -H @- -H 'Accept: application/vnd.github+json' \
+                  -w '\n%{http_code}' "$GITHUB_API/repos/$GITHUB_REPO" 2>/dev/null) || resp=$'\n000'
+          code=${resp##*$'\n'}; rbody=${resp%$'\n'*}
+          if [ "$code" = 200 ]; then
+            pcheck PASS "github repo reachable with the token"
+            case "$rbody" in
+              *'"private":false'*|*'"private": false'*) pcheck WARN "results repo is PUBLIC; transcripts would become public git history" ;;
+            esac
+          else
+            pcheck FAIL "github repo GET failed (HTTP $code)"
+          fi
+        else
+          pcheck FAIL "github mode needs GROKGW_GITHUB_TOKEN or GROKGW_GITHUB_TOKEN_CMD"
+        fi
+      fi ;;
+    callback)
+      case "$CALLBACK_URL" in https://*) pcheck PASS "callback URL is https" ;; *) pcheck FAIL "GROKGW_CALLBACK_URL must be https://" ;; esac
+      if mkdir -p "$CALLBACK_DIR" 2>/dev/null && touch "$CALLBACK_DIR/.doctor" 2>/dev/null; then
+        rm -f "$CALLBACK_DIR/.doctor"; pcheck PASS "callback dir writable ($CALLBACK_DIR)"
+      else pcheck FAIL "callback dir not writable ($CALLBACK_DIR)"; fi
+      resp=$(curl -sS -m 20 -o /dev/null -D - -w '\n%{http_code}' "${CALLBACK_URL%/}/healthz" 2>/dev/null) || resp=$'\n000'
+      code=${resp##*$'\n'}; hdrs=${resp%$'\n'*}
+      if [ "$code" = 200 ] && printf '%s' "$hdrs" | grep -qi '^Server: grokgw-callback'; then
+        pcheck PASS "callback receiver reachable at the public URL (healthz 200 + Server: grokgw-callback)"
+      else
+        pcheck FAIL "receiver not reachable from the public URL (healthz HTTP $code)"
+      fi ;;
+    *)
+      pcheck FAIL "unknown GROKGW_RETURN '$RETURN' (want none|tailnet|tunnel|github|callback)" ;;
+  esac
 
   if [ -n "${GROKGW_DISABLED:-}" ] && [ "$GROKGW_DISABLED" != 0 ]; then
     pcheck WARN "kill switch ON: GROKGW_DISABLED is set; every command that would POST exits 7"
@@ -287,9 +417,9 @@ post() { # $1 = JSON body, $2 = op name; posts and classifies the outcome
           -X POST -H @- -H 'Content-Type: application/json' --data-binary "$1" "$GROKGW_WEBHOOK_URL" 2>/dev/null) || code=000  # quiet: curl errors can echo the URL
   unset k
   case "$code" in
-    2[0-9][0-9]) record_call; return 0 ;;
+    2[0-9][0-9]) record_call; POSTED=1; return 0 ;;
     4[0-9][0-9]) die "webhook rejected the call (HTTP $code); no run started. Check URL/key, or whether the routine is paused." 2 ;;
-    *)           record_call; die "webhook outcome unknown (HTTP $code): the run may have started. request_id=$RID. Do not re-send blindly; try 'grokgw fetch $RID' later (if you have a return path) or check the gateway Bot's chat." 6 ;;
+    *)           record_call; POSTED=1; die "webhook outcome unknown (HTTP $code): the run may have started. request_id=$RID. Do not re-send blindly; try 'grokgw fetch $RID' later (if you have a return path) or check the gateway Bot's chat." 6 ;;
   esac
 }
 
@@ -325,21 +455,53 @@ if [ "$CMD" = doctor ]; then doctor; exit $?; fi
 
 need curl
 
+case "$RETURN" in none|tailnet|tunnel|github|callback) ;; *) die "GROKGW_RETURN must be none|tailnet|tunnel|github|callback" 1 ;; esac
+
 if [ "$CMD" = fetch ]; then
+  require_return fetch
   if [ ${#ARGS[@]} -ne 1 ] || ! is_uuid4 "${ARGS[0]}"; then die "usage: grokgw fetch <request_id uuidv4> [--reply]"; fi
   f="${ARGS[0]}$([ $REPLY = 1 ] && echo .reply).json"
   if [ $WAIT = 1 ]; then body=$(poll "$f") || exit $?; else
-    outbox_note; out=$(outbox_get "$f") || exit 1; code=${out##*$'\n'}; body=${out%$'\n'*}; [ "$code" = 200 ] || die "not ready (HTTP $code)" 3; fi
+    return_note; out=$(fetch_file "$f") || out=$'\n000'; code=${out##*$'\n'}; body=${out%$'\n'*}; [ "$code" = 200 ] || die "not ready (HTTP $code)" 3; fi
   if [ $REPLY = 1 ]; then normalize_reply "$body"; else printf '%s\n' "$body"; fi
   [ "$(status_of "$body")" = error ] && exit 4; exit 0
 fi
 
 RID=$(uuid4)
-base="\"v\":1,\"request_id\":\"$RID\",\"caller\":$(jstr "$CALLER")"
+
+# The return descriptor tells the host where to write; the host validates it against its allowlist.
+case "$RETURN" in
+  none) RETDESC='{"mode":"none"}' ;;
+  tailnet) RETDESC='{"mode":"tailnet"}' ;;
+  tunnel)
+    case "$OUTBOX" in https://*) ;; *) die "tunnel mode needs GROKGW_OUTBOX to be an https:// URL" 1 ;; esac
+    RETDESC='{"mode":"tunnel"}' ;;
+  github)
+    case "$GITHUB_REPO" in ''|/*|*/) die "set GROKGW_GITHUB_REPO=<owner>/<name> for github mode" 1 ;; esac
+    case "$GITHUB_REPO" in */*) ;; *) die "GROKGW_GITHUB_REPO must be <owner>/<name>" 1 ;; esac
+    RETDESC="{\"mode\":\"github\",\"repo\":$(jstr "$GITHUB_REPO")}" ;;
+  callback)
+    [ -n "$CALLBACK_URL" ] || die "set GROKGW_CALLBACK_URL for callback mode" 1
+    case "$CALLBACK_URL" in https://*) ;; *) die "GROKGW_CALLBACK_URL must be https://" 1 ;; esac
+    mkdir -p "$CALLBACK_DIR" 2>/dev/null; chmod 700 "$CALLBACK_DIR" 2>/dev/null || true
+    SECRET=$(gen_secret)
+    SECRET_FILE="$CALLBACK_DIR/$RID.secret"
+    # Drop the per-request secret again if nothing was (possibly) posted: usage error,
+    # kill switch, cost cap, 4xx. Kept after a 2xx or an unknown outcome, since a
+    # delivery may still arrive.
+    trap '[ "${POSTED:-0}" = 1 ] || rm -f "$SECRET_FILE"' EXIT
+    (umask 077; printf '%s' "$SECRET" >"$SECRET_FILE")
+    chmod 600 "$CALLBACK_DIR/$RID.secret" 2>/dev/null || true
+    RETDESC="{\"mode\":\"callback\",\"url\":$(jstr "$CALLBACK_URL"),\"secret\":\"$SECRET\"}"
+    unset SECRET ;;
+esac
+
+base="\"v\":1,\"request_id\":\"$RID\",\"caller\":$(jstr "$CALLER"),\"return\":$RETDESC"
 case "$CMD" in
   ping) [ ${#ARGS[@]} -eq 0 ] || usage 1; OP=ping; BODY="{$base,\"op\":\"ping\"}" ;;
-  list) [ ${#ARGS[@]} -eq 0 ] || usage 1; OP=list_agents; BODY="{$base,\"op\":\"list_agents\"}" ;;
+  list) require_return list; [ ${#ARGS[@]} -eq 0 ] || usage 1; OP=list_agents; BODY="{$base,\"op\":\"list_agents\"}" ;;
   read)
+    require_return read
     [ ${#ARGS[@]} -eq 1 ] || die "usage: grokgw read <agent> [--limit N] [--before N]"
     OP=read_transcript
     BODY="{$base,\"op\":\"read_transcript\",\"agent\":$(jstr "${ARGS[0]}"),\"limit\":${LIMIT:-20}${BEFORE:+,\"before\":$BEFORE}}" ;;
@@ -347,6 +509,8 @@ case "$CMD" in
     [ ${#ARGS[@]} -eq 2 ] || die "usage: grokgw $CMD <agent> <message|-> [--priority] [--wait-reply]"
     OP=send_message
     [ "$CMD" = ask ] && WAIT=1
+    if [ "$CMD" = ask ]; then require_return ask
+    elif [ $WAIT_REPLY = 1 ]; then require_return "send --wait-reply"; fi
     MSG="${ARGS[1]}"; [ "$MSG" = - ] && MSG=$(cat)
     [ -n "$MSG" ] || die "empty message"
     BODY="{$base,\"op\":\"send_message\",\"agent\":$(jstr "${ARGS[0]}"),\"message\":$(jstr "$MSG"),\"priority\":$PRIORITY}" ;;
@@ -354,6 +518,12 @@ case "$CMD" in
 esac
 
 post "$BODY" "$OP"
+
+# none mode never waits: ping/send just report that the run started (or only the rid with --no-wait)
+if [ "$RETURN" = none ]; then
+  if [ $WAIT = 0 ]; then echo "$RID"; else printf '{"request_id":"%s","status":"started","return":"none"}\n' "$RID"; fi
+  exit 0
+fi
 
 if [ "$CMD" = ask ]; then
   echo "grokgw: accepted request_id=$RID; waiting for result (timeout ${TIMEOUT}s)…" >&2

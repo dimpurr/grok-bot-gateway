@@ -11,7 +11,13 @@ as capability tokens, so ids are never written to the log.
 A background thread deletes outbox files older than MAX_AGE_HOURS.
 Stdlib only. Binds loopback, plus the tailnet IP when start.sh finds one.
 (`tailscale serve` was not used: it routes by Host name, so http://<tailnet-IP>:PORT 404s.)
+
+Tunnel mode: if GROKGW_OUTBOX_TOKEN or GROKGW_OUTBOX_TOKEN_FILE is set, every
+request must carry `Authorization: Bearer <token>` (constant-time compare) or
+it gets 401; there are no unauthenticated paths then. Exposes results on the
+public internet, so rotate the token and keep it out of logs.
 """
+import hmac
 import http.server
 import os
 import re
@@ -29,6 +35,25 @@ PORT = int(os.environ.get("GROKGW_PORT", "8787"))
 MAX_AGE_HOURS = float(os.environ.get("GROKGW_MAX_AGE_HOURS", "24"))
 CLEAN_EVERY_S = int(os.environ.get("GROKGW_CLEAN_EVERY_S", "600"))
 MAX_BYTES = 32 * 1024 * 1024
+
+
+def _load_token():
+    # Tunnel mode: require a bearer token on every request. Token is held in memory and never logged.
+    tok = os.environ.get("GROKGW_OUTBOX_TOKEN")
+    if tok:
+        return tok.encode("utf-8")
+    path = os.environ.get("GROKGW_OUTBOX_TOKEN_FILE")
+    if path:
+        try:
+            with open(path, "rb") as f:
+                return f.read().strip()
+        except OSError:
+            sys.stderr.write("outbox: token file unreadable; refusing to start without a token\n")
+            sys.exit(2)
+    return None
+
+
+TOKEN = _load_token()
 
 PATH_RE = re.compile(
     r"^/([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(\.reply)?\.json$"
@@ -94,6 +119,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _serve(self):
         self._kind = "-"
+        if TOKEN is not None:
+            got = self.headers.get("Authorization", "") or ""
+            if not hmac.compare_digest(got, "Bearer " + TOKEN.decode("utf-8", "replace")):
+                return self._send(401, b'{"error":"unauthorized"}')
         path = self.path.split("?", 1)[0]
         m = PATH_RE.match(path)
         if not m:
