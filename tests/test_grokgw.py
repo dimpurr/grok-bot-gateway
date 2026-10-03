@@ -48,18 +48,30 @@ def free_port():
     return port
 
 
-def wait_http(url, timeout=15):
+# Never consult system/env proxies for loopback checks (macOS reads system proxy config).
+_NOPROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def wait_http(url, timeout=15, proc=None, log=None):
     end = time.time() + timeout
     while time.time() < end:
+        if proc is not None and proc.poll() is not None:
+            break
         try:
-            urllib.request.urlopen(url, timeout=2)
+            _NOPROXY.open(url, timeout=2)
             return
         except urllib.error.HTTPError as e:
             e.close()
             return
         except Exception:
             time.sleep(0.1)
-    raise RuntimeError("server did not come up: " + url)
+    detail = ""
+    if proc is not None:
+        detail += " (exit=%s)" % proc.poll()
+    if log and os.path.exists(log):
+        with open(log, errors="replace") as fh:
+            detail += "\n--- server stderr ---\n" + fh.read()[-4000:]
+    raise RuntimeError("server did not come up: " + url + detail)
 
 
 def read_jsonl(path):
@@ -110,10 +122,18 @@ class Base(unittest.TestCase):
                 p.kill()
         self.tmp.cleanup()
 
+    def wait_up(self, url):
+        p = self.procs[-1]
+        wait_http(url, proc=p, log=getattr(p, "log", None))
+
     def start(self, cmd, env=None):
         e = dict(os.environ)
         e.update(env or {})
-        p = subprocess.Popen(cmd, env=e, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log = os.path.join(self.dir, "proc-%d.log" % len(self.procs))
+        fh = open(log, "wb")
+        p = subprocess.Popen(cmd, env=e, stdout=subprocess.DEVNULL, stderr=fh)
+        fh.close()
+        p.log = log
         self.procs.append(p)
         return p
 
@@ -126,14 +146,14 @@ class Base(unittest.TestCase):
         if sleep is not None:
             env["GROKGW_MOCK_SLEEP"] = str(sleep)
         self.start([sys.executable, MOCK], env)
-        wait_http("http://127.0.0.1:%d/healthz" % port)
+        self.wait_up("http://127.0.0.1:%d/healthz" % port)
         return "http://127.0.0.1:%d" % port
 
     def start_outbox(self):
         port = free_port()
         self.start([sys.executable, OUTBOX], {
             "GROKGW_BIND": "127.0.0.1", "GROKGW_PORT": str(port), "GROKGW_OUTBOX_DIR": self.outbox})
-        wait_http("http://127.0.0.1:%d/%s.json" % (port, ZERO))
+        self.wait_up("http://127.0.0.1:%d/%s.json" % (port, ZERO))
         return "http://127.0.0.1:%d" % port
 
     def start_receiver(self):
@@ -143,7 +163,7 @@ class Base(unittest.TestCase):
         self.start([sys.executable, RECEIVER], {
             "GROKGW_CALLBACK_BIND": "127.0.0.1", "GROKGW_CALLBACK_PORT": str(port),
             "GROKGW_CALLBACK_DIR": cbdir})
-        wait_http("http://127.0.0.1:%d/healthz" % port)
+        self.wait_up("http://127.0.0.1:%d/healthz" % port)
         self.cbdir = cbdir
         return port
 
@@ -621,7 +641,7 @@ class TestOutboxToken(Base):
         self.start([sys.executable, OUTBOX], {
             "GROKGW_BIND": "127.0.0.1", "GROKGW_PORT": str(port),
             "GROKGW_OUTBOX_DIR": self.outbox, "GROKGW_OUTBOX_TOKEN": "s3cret"})
-        wait_http("http://127.0.0.1:%d/%s.json" % (port, ZERO))
+        self.wait_up("http://127.0.0.1:%d/%s.json" % (port, ZERO))
         url = "http://127.0.0.1:%d/%s.json" % (port, ZERO)
         self.assertEqual(http(url)[0], 401)
         self.assertEqual(http(url, headers={"Authorization": "Bearer nope"})[0], 401)
