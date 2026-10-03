@@ -52,6 +52,16 @@ def free_port():
 _NOPROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
+def allow_loopback_proxies(env):
+    for name in ("no_proxy", "NO_PROXY"):
+        hosts = [host for host in env.get(name, "").split(",") if host]
+        for host in ("127.0.0.1", "localhost", "::1"):
+            if host not in hosts:
+                hosts.append(host)
+        env[name] = ",".join(hosts)
+    return env
+
+
 def wait_http(url, timeout=15, proc=None, log=None):
     end = time.time() + timeout
     while time.time() < end:
@@ -89,7 +99,7 @@ def read_jsonl(path):
 def http(url, data=None, headers=None, method=None):
     req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        with _NOPROXY.open(req, timeout=10) as r:
             return r.status, r.read()
     except urllib.error.HTTPError as e:
         try:
@@ -129,6 +139,7 @@ class Base(unittest.TestCase):
     def start(self, cmd, env=None):
         e = dict(os.environ)
         e.update(env or {})
+        allow_loopback_proxies(e)
         log = os.path.join(self.dir, "proc-%d.log" % len(self.procs))
         fh = open(log, "wb")
         p = subprocess.Popen(cmd, env=e, stdout=subprocess.DEVNULL, stderr=fh)
@@ -174,10 +185,11 @@ class Base(unittest.TestCase):
                   "GROKGW_POST_TIMEOUT": "5"})
         e.pop("GROKGW_RETURN", None)
         e.update(over)
-        return e
+        return allow_loopback_proxies(e)
 
     def run_grokgw(self, *args, env=None):
         e = env if env is not None else self.env()
+        allow_loopback_proxies(e)
         return subprocess.run(["bash", GROKGW, *args], env=e, capture_output=True, text=True, timeout=90)
 
     def set_status(self, value):
