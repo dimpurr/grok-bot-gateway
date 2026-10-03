@@ -6,6 +6,7 @@
 #   grokgw read <agent> [--limit N] [--before N]
 #   grokgw send <agent> <message|-> [--priority] [--wait-reply]
 #   grokgw fetch <request_id> [--reply]
+#   grokgw doctor              free local/connectivity checks; never posts, never prints secrets
 # Global flags: --no-wait (print request_id only) · --timeout SECONDS (default 600)
 #               --caller TEXT · -h|--help
 #
@@ -36,7 +37,6 @@ CALLER="${GROKGW_CALLER:-grokgw@$(hostname -s 2>/dev/null || echo unknown)}"
 die() { echo "grokgw: $1" >&2; exit "${2:-1}"; }
 usage() { awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit "${1:-0}"; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1" 5; }
-need curl
 
 uuid4() {
   local u=""
@@ -92,6 +92,69 @@ status_of() { # prints status field of a result JSON
   printf '%s' "$1" | grep -o '"status"[[:space:]]*:[[:space:]]*"[a-z]*"' | head -1 | sed 's/.*"\([a-z]*\)"$/\1/'
 }
 
+# ---- doctor: free diagnostics. Never posts to the webhook and never prints secret values.
+DOCTOR_FAIL=0
+pcheck() { printf '%-5s %s\n' "$1" "$2"; [ "$1" = FAIL ] && DOCTOR_FAIL=1; return 0; }
+has() { command -v "$1" >/dev/null 2>&1; }
+
+doctor() {
+  local v u rest hostpart kv resp code hdrs
+  if has curl; then
+    v=$(curl --version 2>/dev/null | head -1 | awk '{print $2}')
+    pcheck PASS "curl present${v:+ (version $v)}"
+  else
+    pcheck FAIL "curl not found"
+  fi
+  if has python3; then pcheck PASS "python3 present"
+  else pcheck WARN "python3 not found (only used to normalize reply files)"; fi
+
+  u="${GROKGW_WEBHOOK_URL:-}"
+  if [ -z "$u" ]; then
+    pcheck FAIL "GROKGW_WEBHOOK_URL not set"
+  elif printf '%s' "$u" | grep -q '[[:space:]]'; then
+    pcheck FAIL "GROKGW_WEBHOOK_URL contains whitespace"
+  elif [ "${u#https://}" = "$u" ]; then
+    pcheck FAIL "GROKGW_WEBHOOK_URL should start with https://"
+  else
+    rest="${u#https://}"; hostpart="${rest%%/*}"
+    if [ -n "$hostpart" ]; then pcheck PASS "GROKGW_WEBHOOK_URL set, https URL shape ok"
+    else pcheck FAIL "GROKGW_WEBHOOK_URL has no host part"; fi
+  fi
+
+  if [ -n "${GROKGW_WEBHOOK_KEY:-}" ]; then
+    pcheck PASS "webhook key set (GROKGW_WEBHOOK_KEY)"
+  elif [ -n "${GROKGW_WEBHOOK_KEY_CMD:-}" ]; then
+    kv=$(sh -c "$GROKGW_WEBHOOK_KEY_CMD" 2>/dev/null | tr -d '\r\n')
+    if [ -n "$kv" ]; then pcheck PASS "webhook key set (GROKGW_WEBHOOK_KEY_CMD produced output)"
+    else pcheck FAIL "GROKGW_WEBHOOK_KEY_CMD produced no output"; fi
+    unset kv
+  else
+    pcheck FAIL "no webhook key (set GROKGW_WEBHOOK_KEY or GROKGW_WEBHOOK_KEY_CMD)"
+  fi
+
+  if [ -z "${GROKGW_OUTBOX:-}" ]; then
+    pcheck INFO "GROKGW_OUTBOX not set (loopback default; only right on the gateway's computer)"
+  else
+    resp=$(curl -sS -m 20 -o /dev/null -D - -w '\n%{http_code}' \
+            "$OUTBOX/00000000-0000-4000-8000-000000000000.json" 2>/dev/null) || resp=$'\n000'
+    code=${resp##*$'\n'}; hdrs=${resp%$'\n'*}
+    if [ "$code" = 404 ]; then
+      if printf '%s' "$hdrs" | grep -qi '^Server: outbox'; then
+        pcheck PASS "outbox reachable and answers as outbox_server.py (404 + Server: outbox)"
+      else
+        pcheck FAIL "something else answers at the outbox URL (404 without Server: outbox)"
+      fi
+    elif [ "$code" = 000 ]; then
+      pcheck FAIL "outbox unreachable (connection error)"
+    else
+      pcheck FAIL "unexpected outbox response (HTTP $code)"
+    fi
+  fi
+
+  pcheck INFO "doctor spent no Bot usage; 'grokgw ping' does a real round trip (one Bot run)"
+  return $DOCTOR_FAIL
+}
+
 post() { # $1 = JSON body, $2 = op name; posts and classifies the outcome
   [ -n "${GROKGW_WEBHOOK_URL:-}" ] || die "set GROKGW_WEBHOOK_URL"
   local hname="${GROKGW_AUTH_HEADER:-Authorization}" k code
@@ -135,6 +198,10 @@ done
 case "$TIMEOUT" in ''|*[!0-9]*) die "--timeout must be seconds" ;; esac
 for n in "$LIMIT" "$BEFORE"; do case "$n" in ''|*[!0-9]*) [ -z "$n" ] || die "--limit/--before must be non-negative integers" ;; esac; done
 if [ -n "$LIMIT" ] && { [ "$LIMIT" -lt 1 ] || [ "$LIMIT" -gt 200 ]; }; then die "--limit must be 1..200"; fi
+
+if [ "$CMD" = doctor ]; then doctor; exit $?; fi
+
+need curl
 
 if [ "$CMD" = fetch ]; then
   if [ ${#ARGS[@]} -ne 1 ] || ! is_uuid4 "${ARGS[0]}"; then die "usage: grokgw fetch <request_id uuidv4> [--reply]"; fi
