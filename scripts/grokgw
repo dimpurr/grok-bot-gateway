@@ -20,7 +20,13 @@
 #                           routes by host name (e.g. <machine>.<tailnet>.ts.net:8787)
 #   GROKGW_CALLER           default caller tag (default: grokgw@<hostname>)
 #   GROKGW_AUTH_HEADER      header name for the key (default Authorization, value "Bearer <key>")
-# Exit codes: 0 ok · 1 usage · 2 webhook rejected · 3 timeout · 4 result status=error · 5 dependency
+#   GROKGW_POST_TIMEOUT     POST timeout in seconds (default 30)
+#
+# Exit codes:
+#   0 ok · 1 usage/config · 2 webhook rejected (4xx), no run started
+#   3 timed out waiting for result (run started) · 4 result status=error · 5 missing dependency
+#   6 webhook outcome unknown, may have started · 7 blocked locally, nothing sent
+#     (cost cap, kill switch, op needs a return path)
 set -u
 
 OUTBOX="${GROKGW_OUTBOX:-http://127.0.0.1:8787}"; OUTBOX="${OUTBOX%/}"
@@ -28,7 +34,7 @@ TIMEOUT=600; WAIT=1; WAIT_REPLY=0; REPLY=0; PRIORITY=false; LIMIT=""; BEFORE=""
 CALLER="${GROKGW_CALLER:-grokgw@$(hostname -s 2>/dev/null || echo unknown)}"
 
 die() { echo "grokgw: $1" >&2; exit "${2:-1}"; }
-usage() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit "${1:-0}"; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1" 5; }
 need curl
 
@@ -86,16 +92,23 @@ status_of() { # prints status field of a result JSON
   printf '%s' "$1" | grep -o '"status"[[:space:]]*:[[:space:]]*"[a-z]*"' | head -1 | sed 's/.*"\([a-z]*\)"$/\1/'
 }
 
-post() { # $1 = JSON body
+post() { # $1 = JSON body, $2 = op name; posts and classifies the outcome
   [ -n "${GROKGW_WEBHOOK_URL:-}" ] || die "set GROKGW_WEBHOOK_URL"
   local hname="${GROKGW_AUTH_HEADER:-Authorization}" k code
+  local tmo="${GROKGW_POST_TIMEOUT:-30}"
+  case "$tmo" in ''|*[!0-9]*) die "GROKGW_POST_TIMEOUT must be seconds" ;; esac
   k=$(key) || exit 1
   [ -n "$k" ] || die "webhook key is empty"
+  printf 'grokgw: request_id=%s (posting %s…)\n' "$RID" "$2" >&2
   # Header comes from stdin (-H @-) so the key never appears in argv / ps.
-  code=$(printf '%s: Bearer %s\n' "$hname" "$k" | curl -s -m 30 -o /dev/null -w '%{http_code}' \
+  code=$(printf '%s: Bearer %s\n' "$hname" "$k" | curl -s -m "$tmo" -o /dev/null -w '%{http_code}' \
           -X POST -H @- -H 'Content-Type: application/json' --data-binary "$1" "$GROKGW_WEBHOOK_URL" 2>/dev/null) || code=000  # quiet: curl errors can echo the URL
   unset k
-  [ "$code" = 200 ] || die "webhook returned HTTP $code (run not started: check URL, key, routine paused?)" 2
+  case "$code" in
+    2[0-9][0-9]) return 0 ;;
+    4[0-9][0-9]) die "webhook rejected the call (HTTP $code); no run started. Check URL/key, or whether the routine is paused." 2 ;;
+    *)           die "webhook outcome unknown (HTTP $code): the run may have started. request_id=$RID. Do not re-send blindly; try 'grokgw fetch $RID' later (if you have a return path) or check the gateway Bot's chat." 6 ;;
+  esac
 }
 
 # ---- parse
@@ -124,7 +137,7 @@ for n in "$LIMIT" "$BEFORE"; do case "$n" in ''|*[!0-9]*) [ -z "$n" ] || die "--
 if [ -n "$LIMIT" ] && { [ "$LIMIT" -lt 1 ] || [ "$LIMIT" -gt 200 ]; }; then die "--limit must be 1..200"; fi
 
 if [ "$CMD" = fetch ]; then
-  [ ${#ARGS[@]} -eq 1 ] && is_uuid4 "${ARGS[0]}" || die "usage: grokgw fetch <request_id uuidv4> [--reply]"
+  if [ ${#ARGS[@]} -ne 1 ] || ! is_uuid4 "${ARGS[0]}"; then die "usage: grokgw fetch <request_id uuidv4> [--reply]"; fi
   f="${ARGS[0]}$([ $REPLY = 1 ] && echo .reply).json"
   if [ $WAIT = 1 ]; then body=$(poll "$f") || exit $?; else
     outbox_note; out=$(outbox_get "$f") || exit 1; code=${out##*$'\n'}; body=${out%$'\n'*}; [ "$code" = 200 ] || die "not ready (HTTP $code)" 3; fi
@@ -134,20 +147,22 @@ fi
 RID=$(uuid4)
 base="\"v\":1,\"request_id\":\"$RID\",\"caller\":$(jstr "$CALLER")"
 case "$CMD" in
-  ping) [ ${#ARGS[@]} -eq 0 ] || usage 1; BODY="{$base,\"op\":\"ping\"}" ;;
-  list) [ ${#ARGS[@]} -eq 0 ] || usage 1; BODY="{$base,\"op\":\"list_agents\"}" ;;
+  ping) [ ${#ARGS[@]} -eq 0 ] || usage 1; OP=ping; BODY="{$base,\"op\":\"ping\"}" ;;
+  list) [ ${#ARGS[@]} -eq 0 ] || usage 1; OP=list_agents; BODY="{$base,\"op\":\"list_agents\"}" ;;
   read)
     [ ${#ARGS[@]} -eq 1 ] || die "usage: grokgw read <agent> [--limit N] [--before N]"
+    OP=read_transcript
     BODY="{$base,\"op\":\"read_transcript\",\"agent\":$(jstr "${ARGS[0]}"),\"limit\":${LIMIT:-50}${BEFORE:+,\"before\":$BEFORE}}" ;;
   send)
     [ ${#ARGS[@]} -eq 2 ] || die "usage: grokgw send <agent> <message|-> [--priority] [--wait-reply]"
+    OP=send_message
     MSG="${ARGS[1]}"; [ "$MSG" = - ] && MSG=$(cat)
     [ -n "$MSG" ] || die "empty message"
     BODY="{$base,\"op\":\"send_message\",\"agent\":$(jstr "${ARGS[0]}"),\"message\":$(jstr "$MSG"),\"priority\":$PRIORITY}" ;;
   *) usage 1 ;;
 esac
 
-post "$BODY"
+post "$BODY" "$OP"
 if [ $WAIT = 0 ]; then echo "$RID"; exit 0; fi
 echo "grokgw: accepted request_id=$RID; waiting for result (timeout ${TIMEOUT}s)…" >&2
 res=$(poll "$RID.json") || exit $?
