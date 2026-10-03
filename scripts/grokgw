@@ -5,10 +5,12 @@
 #   grokgw list
 #   grokgw read <agent> [--limit N] [--before N]
 #   grokgw send <agent> <message|-> [--priority] [--wait-reply]
+#   grokgw ask <agent> <message|-> [--timeout S] [--reply-timeout S] [--json]
 #   grokgw fetch <request_id> [--reply]
 #   grokgw doctor              free local/connectivity checks; never posts, never prints secrets
 # Global flags: --no-wait (print request_id only) · --timeout SECONDS (default 600)
-#               --caller TEXT · -h|--help
+#   --reply-timeout SECONDS (ask reply wait, default 900) · --json (ask: print reply JSON)
+#   --caller TEXT · -h|--help
 #
 # Environment:
 #   GROKGW_WEBHOOK_URL      routine webhook URL ("POST to" field)          required for requests
@@ -36,6 +38,7 @@ set -u
 
 OUTBOX="${GROKGW_OUTBOX:-http://127.0.0.1:8787}"; OUTBOX="${OUTBOX%/}"
 TIMEOUT=600; WAIT=1; WAIT_REPLY=0; REPLY=0; PRIORITY=false; LIMIT=""; BEFORE=""
+REPLY_TIMEOUT=900; JSONOUT=0
 CALLER="${GROKGW_CALLER:-grokgw@$(hostname -s 2>/dev/null || echo unknown)}"
 STATE_DIR="${GROKGW_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/grokgw}"
 CALLS="$STATE_DIR/calls"; LOCK="$STATE_DIR/lock"
@@ -134,8 +137,8 @@ outbox_get() { # $1 = file name; body to stdout; prints http code to fd 3
 
 outbox_note() { [ -n "${GROKGW_OUTBOX:-}" ] || echo "grokgw: GROKGW_OUTBOX not set; using $OUTBOX" >&2; }
 
-poll() { # $1 = file name; waits up to TIMEOUT; prints body
-  local start now out code body delay=2
+poll() { # $1 = file name, $2 = timeout seconds (default TIMEOUT); prints body
+  local to="${2:-$TIMEOUT}" start now out code body delay=2 hint
   outbox_note
   start=$(date +%s)
   while :; do
@@ -143,8 +146,12 @@ poll() { # $1 = file name; waits up to TIMEOUT; prints body
     code=${out##*$'\n'}; body=${out%$'\n'*}
     if [ "$code" = 200 ]; then printf '%s\n' "$body"; return 0; fi
     now=$(date +%s)
-    if [ $((now - start)) -ge "$TIMEOUT" ]; then
-      echo "grokgw: timed out after ${TIMEOUT}s waiting for $1 (last HTTP $code). Fetch later: grokgw fetch ${1%%.*}" >&2
+    if [ $((now - start)) -ge "$to" ]; then
+      case "$1" in
+        *.reply.json) hint="grokgw fetch ${1%.reply.json} --reply" ;;
+        *) hint="grokgw fetch ${1%.json}" ;;
+      esac
+      echo "grokgw: timed out after ${to}s waiting for $1 (last HTTP $code). Fetch later: $hint" >&2
       return 3
     fi
     sleep "$delay"; delay=$(( delay < 30 ? delay * 3 / 2 + 1 : 30 ))
@@ -153,6 +160,41 @@ poll() { # $1 = file name; waits up to TIMEOUT; prints body
 
 status_of() { # prints status field of a result JSON
   printf '%s' "$1" | grep -o '"status"[[:space:]]*:[[:space:]]*"[a-z]*"' | head -1 | sed 's/.*"\([a-z]*\)"$/\1/'
+}
+
+# ---- reply normalization: older gateways wrote `text`; clients present `reply`.
+normalize_reply() { # $1 = reply JSON; prints JSON with text -> reply (needs python3)
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "grokgw: python3 not found; printing reply file as-is (no text->reply normalization)" >&2
+    printf '%s\n' "$1"
+    return 0
+  fi
+  printf '%s' "$1" | python3 -c '
+import json, sys
+data = sys.stdin.read()
+try:
+    d = json.loads(data)
+except Exception:
+    sys.stdout.write(data)
+    sys.exit(0)
+if isinstance(d, dict) and "reply" not in d and isinstance(d.get("text"), str):
+    d["reply"] = d.pop("text")
+json.dump(d, sys.stdout, ensure_ascii=False)
+sys.stdout.write("\n")
+'
+}
+reply_field() { # $1 = normalized reply JSON; prints just the reply text
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$1" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+sys.stdout.write(d.get("reply", d.get("text", "")) if isinstance(d, dict) else "")
+sys.stdout.write("\n")
+'
+  else
+    echo "grokgw: python3 not found; cannot extract the reply text" >&2
+    printf '%s\n' "$1"
+  fi
 }
 
 # ---- doctor: free diagnostics. Never posts to the webhook and never prints secret values.
@@ -265,7 +307,9 @@ while [ $# -gt 0 ]; do
     --no-wait) WAIT=0; shift ;;
     --wait-reply) WAIT_REPLY=1; shift ;;
     --reply) REPLY=1; shift ;;
+    --json) JSONOUT=1; shift ;;
     --timeout) TIMEOUT="${2:-}"; shift 2 ;;
+    --reply-timeout) REPLY_TIMEOUT="${2:-}"; shift 2 ;;
     --caller) CALLER="${2:-}"; shift 2 ;;
     -h|--help) usage 0 ;;
     --) shift; while [ $# -gt 0 ]; do ARGS+=("$1"); shift; done ;;
@@ -273,6 +317,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$TIMEOUT" in ''|*[!0-9]*) die "--timeout must be seconds" ;; esac
+case "$REPLY_TIMEOUT" in ''|*[!0-9]*) die "--reply-timeout must be seconds" ;; esac
 for n in "$LIMIT" "$BEFORE"; do case "$n" in ''|*[!0-9]*) [ -z "$n" ] || die "--limit/--before must be non-negative integers" ;; esac; done
 if [ -n "$LIMIT" ] && { [ "$LIMIT" -lt 1 ] || [ "$LIMIT" -gt 200 ]; }; then die "--limit must be 1..200"; fi
 
@@ -285,7 +330,8 @@ if [ "$CMD" = fetch ]; then
   f="${ARGS[0]}$([ $REPLY = 1 ] && echo .reply).json"
   if [ $WAIT = 1 ]; then body=$(poll "$f") || exit $?; else
     outbox_note; out=$(outbox_get "$f") || exit 1; code=${out##*$'\n'}; body=${out%$'\n'*}; [ "$code" = 200 ] || die "not ready (HTTP $code)" 3; fi
-  printf '%s\n' "$body"; [ "$(status_of "$body")" = error ] && exit 4; exit 0
+  if [ $REPLY = 1 ]; then normalize_reply "$body"; else printf '%s\n' "$body"; fi
+  [ "$(status_of "$body")" = error ] && exit 4; exit 0
 fi
 
 RID=$(uuid4)
@@ -297,9 +343,10 @@ case "$CMD" in
     [ ${#ARGS[@]} -eq 1 ] || die "usage: grokgw read <agent> [--limit N] [--before N]"
     OP=read_transcript
     BODY="{$base,\"op\":\"read_transcript\",\"agent\":$(jstr "${ARGS[0]}"),\"limit\":${LIMIT:-20}${BEFORE:+,\"before\":$BEFORE}}" ;;
-  send)
-    [ ${#ARGS[@]} -eq 2 ] || die "usage: grokgw send <agent> <message|-> [--priority] [--wait-reply]"
+  send|ask)
+    [ ${#ARGS[@]} -eq 2 ] || die "usage: grokgw $CMD <agent> <message|-> [--priority] [--wait-reply]"
     OP=send_message
+    [ "$CMD" = ask ] && WAIT=1
     MSG="${ARGS[1]}"; [ "$MSG" = - ] && MSG=$(cat)
     [ -n "$MSG" ] || die "empty message"
     BODY="{$base,\"op\":\"send_message\",\"agent\":$(jstr "${ARGS[0]}"),\"message\":$(jstr "$MSG"),\"priority\":$PRIORITY}" ;;
@@ -307,6 +354,23 @@ case "$CMD" in
 esac
 
 post "$BODY" "$OP"
+
+if [ "$CMD" = ask ]; then
+  echo "grokgw: accepted request_id=$RID; waiting for result (timeout ${TIMEOUT}s)…" >&2
+  res=$(poll "$RID.json") || exit $?
+  st=$(status_of "$res")
+  if [ "$st" != ok ]; then
+    printf '%s\n' "$res"
+    [ "$st" = error ] && exit 4
+    die "result has no status ok; not waiting for a reply" 1
+  fi
+  echo "grokgw: waiting for reply (timeout ${REPLY_TIMEOUT}s)…" >&2
+  rbody=$(poll "$RID.reply.json" "$REPLY_TIMEOUT") || exit $?
+  norm=$(normalize_reply "$rbody")
+  if [ "$JSONOUT" = 1 ]; then printf '%s\n' "$norm"; else reply_field "$norm"; fi
+  exit 0
+fi
+
 if [ $WAIT = 0 ]; then echo "$RID"; exit 0; fi
 echo "grokgw: accepted request_id=$RID; waiting for result (timeout ${TIMEOUT}s)…" >&2
 res=$(poll "$RID.json") || exit $?
@@ -314,7 +378,8 @@ printf '%s\n' "$res"
 st=$(status_of "$res")
 if [ "$CMD" = send ] && [ $WAIT_REPLY = 1 ] && [ "$st" = ok ]; then
   echo "grokgw: waiting for reply…" >&2
-  poll "$RID.reply.json" || exit $?
+  rbody=$(poll "$RID.reply.json") || exit $?
+  normalize_reply "$rbody"
 fi
 [ "$st" = error ] && exit 4
 exit 0

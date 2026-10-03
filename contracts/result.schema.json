@@ -2,15 +2,16 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "grok-bot-gateway/result@1",
   "title": "Grok Bot gateway result and reply files",
-  "description": "Written by the gateway Bot to <outbox>/<request_id>.json (result) and <outbox>/<request_id>.reply.json (relayed reply), each written as .part then renamed.",
-  "oneOf": [
-    {
-      "$ref": "#/$defs/result"
-    },
-    {
-      "$ref": "#/$defs/reply"
-    }
-  ],
+  "description": "Written by the gateway Bot to <outbox>/<request_id>.json (result) and <outbox>/<request_id>.reply.json (relayed reply), each written as .part then renamed. Discriminated on the presence of `status`: a result has `status`, a reply has `reply`/`text` after normalisation.",
+  "if": {
+    "required": ["status"]
+  },
+  "then": {
+    "$ref": "#/$defs/result"
+  },
+  "else": {
+    "$ref": "#/$defs/reply"
+  },
   "$defs": {
     "uuid4": {
       "type": "string",
@@ -196,8 +197,19 @@
         "v",
         "request_id",
         "from_agent",
-        "received_at",
-        "reply"
+        "received_at"
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "reply"
+          ]
+        },
+        {
+          "required": [
+            "text"
+          ]
+        }
       ],
       "properties": {
         "v": {
@@ -215,7 +227,11 @@
         },
         "reply": {
           "type": "string",
-          "description": "The relayed reply text. Gateways must write this field; callers should also accept a `text` field from files written by older gateway instructions."
+          "description": "The relayed reply text. Gateways must write this field; callers normalise a `text` field from files written by older gateway instructions."
+        },
+        "text": {
+          "type": "string",
+          "description": "deprecated: older gateways; clients normalize to reply"
         }
       }
     }
