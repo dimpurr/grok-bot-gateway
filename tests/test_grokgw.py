@@ -313,6 +313,7 @@ class TestReplyNormalization(Base):
         obj = json.loads(last)
         self.assertEqual(obj["reply"], "mock reply text")
         self.assertNotIn("text", obj)
+        self.assertIs(self.log()[0]["priority"], True)
 
     def test_ask_prints_text(self):
         mock = self.start_mock(reply_field="reply")
@@ -321,6 +322,14 @@ class TestReplyNormalization(Base):
         r = self.run_grokgw("ask", "a1", "hi", "--timeout", "20", "--reply-timeout", "20", env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "mock reply text")
+        self.assertIs(self.log()[0]["priority"], True)
+
+    def test_plain_send_is_not_priority(self):
+        mock = self.start_mock()
+        env = self.env(GROKGW_WEBHOOK_URL=mock + "/hook")
+        r = self.run_grokgw("send", "a1", "hi", env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIs(self.log()[0]["priority"], False)
 
 
 class TestTailnet(Base):

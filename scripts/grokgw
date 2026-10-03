@@ -511,6 +511,9 @@ case "$CMD" in
     [ "$CMD" = ask ] && WAIT=1
     if [ "$CMD" = ask ]; then require_return ask
     elif [ $WAIT_REPLY = 1 ]; then require_return "send --wait-reply"; fi
+    # A caller that waits for a reply needs the target Bot to wake now; a
+    # non-priority relay is only read on the target's next turn.
+    if [ "$CMD" = ask ] || [ $WAIT_REPLY = 1 ]; then PRIORITY=true; fi
     MSG="${ARGS[1]}"; [ "$MSG" = - ] && MSG=$(cat)
     [ -n "$MSG" ] || die "empty message"
     BODY="{$base,\"op\":\"send_message\",\"agent\":$(jstr "${ARGS[0]}"),\"message\":$(jstr "$MSG"),\"priority\":$PRIORITY}" ;;
