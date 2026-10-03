@@ -31,6 +31,7 @@ import os
 import re
 import sys
 import time
+import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BIND = os.environ.get("GROKGW_CALLBACK_BIND", "127.0.0.1")
@@ -140,9 +141,18 @@ class Handler(BaseHTTPRequestHandler):
     do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _no
 
 
+class Server(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer.server_bind calls socket.getfqdn(), a reverse-DNS lookup
+        # that can stall for tens of seconds on macOS (seen on GitHub runners).
+        # We never use server_name, so bind without the lookup.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 def main():
     os.makedirs(DIR, exist_ok=True)
-    srv = ThreadingHTTPServer((BIND, PORT), Handler)
+    srv = Server((BIND, PORT), Handler)
     sys.stderr.write("grokgw-callback listening on %s:%d dir=%s\n" % (BIND, PORT, DIR))
     sys.stderr.flush()
     srv.serve_forever()
