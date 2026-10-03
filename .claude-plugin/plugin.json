@@ -1,0 +1,15 @@
+{
+  "name": "grok-bot-gateway",
+  "displayName": "Grok Bot Gateway",
+  "version": "0.3.0",
+  "description": "An official-webhook-only gateway to all your Grok Bots: list them, read their transcripts and message them. Getting results back is optional, over a return path you choose.",
+  "author": {
+    "name": "dimpurr",
+    "email": "dimpurr@live.com",
+    "url": "https://github.com/dimpurr"
+  },
+  "homepage": "https://github.com/dimpurr/skills/tree/main/skills/grok-bot-gateway",
+  "repository": "https://github.com/dimpurr/skills",
+  "license": "Apache-2.0",
+  "keywords": ["grok-bot", "webhook", "gateway", "agents"]
+}

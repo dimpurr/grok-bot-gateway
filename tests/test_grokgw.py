@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -22,6 +23,7 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+REPO_ROOT = os.path.dirname(os.path.dirname(ROOT))
 SCRIPTS = os.path.join(ROOT, "scripts")
 GROKGW = os.path.join(SCRIPTS, "grokgw")
 MOCK = os.path.join(HERE, "mock_server.py")
@@ -577,6 +579,40 @@ class TestDoctor(Base):
         self.assertNotIn(url, combined)
         self.assertEqual(self.log(), [])
         self.assertIn("doctor spent no Bot usage", combined)
+
+
+class TestManifests(Base):
+    def _read(self, *parts):
+        with open(os.path.join(*parts), "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_manifests(self):
+        claude = self._read(ROOT, ".claude-plugin", "plugin.json")
+        cursor = self._read(ROOT, ".cursor-plugin", "plugin.json")
+        mkt_claude = self._read(REPO_ROOT, ".claude-plugin", "marketplace.json")
+        mkt_cursor = self._read(REPO_ROOT, ".cursor-plugin", "marketplace.json")
+
+        with open(os.path.join(ROOT, "SKILL.md"), "r", encoding="utf-8") as f:
+            skill = f.read()
+        m = re.search(r'^[ \t]*version:[ \t]*"?([0-9.]+)"?', skill, re.MULTILINE)
+        self.assertIsNotNone(m, "SKILL.md has no metadata.version")
+        skill_version = m.group(1)
+
+        self.assertEqual(claude["name"], "grok-bot-gateway")
+        self.assertEqual(cursor["name"], "grok-bot-gateway")
+        self.assertEqual(claude["version"], "0.3.0")
+        self.assertEqual(cursor["version"], skill_version)
+        self.assertEqual(claude["version"], skill_version)
+        self.assertNotIn("skills", claude)
+        self.assertNotIn("skills", cursor)
+        self.assertEqual(set(cursor["author"]), {"name", "email"})
+
+        for mkt in (mkt_claude, mkt_cursor):
+            self.assertEqual(mkt["name"], "dimpurr-skills")
+            names = [p["name"] for p in mkt["plugins"]]
+            self.assertIn("grok-bot-gateway", names)
+        self.assertIn("source", mkt_claude["plugins"][0])
+        self.assertEqual(set(mkt_cursor["plugins"][0]), {"name", "source", "description"})
 
 
 class TestOutboxToken(Base):

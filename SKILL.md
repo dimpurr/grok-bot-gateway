@@ -5,7 +5,7 @@ license: Apache-2.0
 compatibility: Host needs a Grok Bot account that can create webhook routines, and Python 3 on the Bot's computer. Caller needs bash and curl. The outbox pull path assumes the Bot's computer and the caller share a Tailscale tailnet; alternatives are described.
 metadata:
   author: dimpurr
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # Grok Bot gateway
