@@ -1,0 +1,17 @@
+{
+  "name": "grok-bot-gateway",
+  "owner": {
+    "name": "dimpurr",
+    "email": "dimpurr@live.com"
+  },
+  "metadata": {
+    "description": "Grok Bot Gateway plugin by dimpurr"
+  },
+  "plugins": [
+    {
+      "name": "grok-bot-gateway",
+      "source": ".",
+      "description": "An official-webhook-only gateway to all your Grok Bots: list them, read their transcripts and message them. Getting results back is optional, over a return path you choose."
+    }
+  ]
+}

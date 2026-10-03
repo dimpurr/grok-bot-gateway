@@ -8,8 +8,13 @@
     "email": "dimpurr@live.com",
     "url": "https://github.com/dimpurr"
   },
-  "homepage": "https://github.com/dimpurr/skills/tree/main/skills/grok-bot-gateway",
-  "repository": "https://github.com/dimpurr/skills",
+  "homepage": "https://github.com/dimpurr/grok-bot-gateway",
+  "repository": "https://github.com/dimpurr/grok-bot-gateway",
   "license": "Apache-2.0",
-  "keywords": ["grok-bot", "webhook", "gateway", "agents"]
+  "keywords": [
+    "grok-bot",
+    "webhook",
+    "gateway",
+    "agents"
+  ]
 }

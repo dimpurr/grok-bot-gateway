@@ -23,7 +23,7 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-REPO_ROOT = os.path.dirname(os.path.dirname(ROOT))
+REPO_ROOT = ROOT
 SCRIPTS = os.path.join(ROOT, "scripts")
 GROKGW = os.path.join(SCRIPTS, "grokgw")
 MOCK = os.path.join(HERE, "mock_server.py")
@@ -640,11 +640,13 @@ class TestManifests(Base):
         self.assertEqual(set(cursor["author"]), {"name", "email"})
 
         for mkt in (mkt_claude, mkt_cursor):
-            self.assertEqual(mkt["name"], "dimpurr-skills")
+            self.assertEqual(mkt["name"], "grok-bot-gateway")
             names = [p["name"] for p in mkt["plugins"]]
             self.assertIn("grok-bot-gateway", names)
         self.assertIn("source", mkt_claude["plugins"][0])
         self.assertEqual(set(mkt_cursor["plugins"][0]), {"name", "source", "description"})
+        self.assertEqual(mkt_claude["plugins"][0]["source"], ".")
+        self.assertEqual(mkt_cursor["plugins"][0]["source"], ".")
 
 
 class TestOutboxToken(Base):
