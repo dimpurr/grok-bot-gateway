@@ -22,6 +22,10 @@
 #   GROKGW_CALLER           default caller tag (default: grokgw@<hostname>)
 #   GROKGW_AUTH_HEADER      header name for the key (default Authorization, value "Bearer <key>")
 #   GROKGW_POST_TIMEOUT     POST timeout in seconds (default 30)
+#   GROKGW_STATE_DIR        client state dir (default ${XDG_STATE_HOME:-$HOME/.local/state}/grokgw)
+#   GROKGW_MAX_PER_HOUR     hourly cap on webhook POSTs (default 12; 0 = no cap)
+#   GROKGW_DISABLED         non-empty and not "0" (or the file $GROKGW_STATE_DIR/disabled)
+#                           blocks every command that would POST; fetch and doctor still work
 #
 # Exit codes:
 #   0 ok · 1 usage/config · 2 webhook rejected (4xx), no run started
@@ -33,6 +37,8 @@ set -u
 OUTBOX="${GROKGW_OUTBOX:-http://127.0.0.1:8787}"; OUTBOX="${OUTBOX%/}"
 TIMEOUT=600; WAIT=1; WAIT_REPLY=0; REPLY=0; PRIORITY=false; LIMIT=""; BEFORE=""
 CALLER="${GROKGW_CALLER:-grokgw@$(hostname -s 2>/dev/null || echo unknown)}"
+STATE_DIR="${GROKGW_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/grokgw}"
+CALLS="$STATE_DIR/calls"; LOCK="$STATE_DIR/lock"
 
 die() { echo "grokgw: $1" >&2; exit "${2:-1}"; }
 usage() { awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit "${1:-0}"; }
@@ -61,6 +67,63 @@ key() {
   if [ -n "${GROKGW_WEBHOOK_KEY:-}" ]; then printf '%s' "$GROKGW_WEBHOOK_KEY"
   elif [ -n "${GROKGW_WEBHOOK_KEY_CMD:-}" ]; then sh -c "$GROKGW_WEBHOOK_KEY_CMD" | tr -d '\r\n'
   else die "set GROKGW_WEBHOOK_KEY or GROKGW_WEBHOOK_KEY_CMD"; fi
+}
+
+# ---- state dir, kill switch and hourly cost guard (all local; nothing sent when blocked)
+ensure_state() { [ -d "$STATE_DIR" ] || mkdir -p "$STATE_DIR" 2>/dev/null; chmod 700 "$STATE_DIR" 2>/dev/null || true; }
+is_disabled() {
+  if [ -n "${GROKGW_DISABLED:-}" ] && [ "$GROKGW_DISABLED" != 0 ]; then return 0; fi
+  [ -e "$STATE_DIR/disabled" ] && return 0
+  return 1
+}
+lock_acquire() { # mkdir lock, stale after 10 s
+  local tries=0 now ts
+  while :; do
+    if mkdir "$LOCK" 2>/dev/null; then printf '%s\n' "$$" >"$LOCK/pid" 2>/dev/null; return 0; fi
+    now=$(date +%s)
+    ts=$(stat -f %m "$LOCK" 2>/dev/null || stat -c %Y "$LOCK" 2>/dev/null || echo "$now")
+    if [ $((now - ts)) -gt 10 ]; then rm -rf "$LOCK" 2>/dev/null; continue; fi
+    tries=$((tries + 1)); [ "$tries" -gt 100 ] && return 1
+    sleep 0.1
+  done
+}
+lock_release() { rm -rf "$LOCK" 2>/dev/null; return 0; }
+count_recent() { # prints how many ledger lines are within the last hour (no side effects)
+  local now cutoff n=0 t
+  [ -f "$CALLS" ] || { echo 0; return 0; }
+  now=$(date +%s); cutoff=$((now - 3600))
+  while IFS= read -r t; do
+    case "$t" in ''|*[!0-9]*) continue ;; esac
+    [ "$t" -ge "$cutoff" ] && n=$((n + 1))
+  done <"$CALLS"
+  echo "$n"
+}
+guard() { # exit 7 if the kill switch is on or the hourly cap is reached; prunes the ledger
+  local cap n now cutoff tmp t
+  is_disabled && die "disabled by kill switch (GROKGW_DISABLED or $STATE_DIR/disabled); nothing sent" 7
+  ensure_state
+  cap="${GROKGW_MAX_PER_HOUR:-12}"
+  case "$cap" in ''|*[!0-9]*) die "GROKGW_MAX_PER_HOUR must be a non-negative integer" ;; esac
+  [ "$cap" = 0 ] && return 0
+  lock_acquire || die "could not acquire state lock $LOCK" 1
+  n=0; now=$(date +%s); cutoff=$((now - 3600)); tmp="$CALLS.tmp.$$"
+  : >"$tmp" 2>/dev/null
+  if [ -f "$CALLS" ]; then
+    while IFS= read -r t; do
+      case "$t" in ''|*[!0-9]*) continue ;; esac
+      if [ "$t" -ge "$cutoff" ]; then printf '%s\n' "$t" >>"$tmp"; n=$((n + 1)); fi
+    done <"$CALLS"
+  fi
+  if [ -e "$tmp" ]; then mv "$tmp" "$CALLS" 2>/dev/null || rm -f "$tmp"; fi
+  lock_release
+  [ "$n" -ge "$cap" ] && die "hourly cap reached ($n/$cap in the last hour, GROKGW_MAX_PER_HOUR); nothing sent" 7
+  return 0
+}
+record_call() { # append one ledger line for a POST that started or had an unknown outcome
+  ensure_state
+  lock_acquire || return 0
+  date +%s >>"$CALLS" 2>/dev/null || true
+  lock_release
 }
 
 outbox_get() { # $1 = file name; body to stdout; prints http code to fd 3
@@ -151,6 +214,19 @@ doctor() {
     fi
   fi
 
+  if [ -n "${GROKGW_DISABLED:-}" ] && [ "$GROKGW_DISABLED" != 0 ]; then
+    pcheck WARN "kill switch ON: GROKGW_DISABLED is set; every command that would POST exits 7"
+  elif [ -e "$STATE_DIR/disabled" ]; then
+    pcheck WARN "kill switch ON: $STATE_DIR/disabled exists; every command that would POST exits 7"
+  else
+    pcheck INFO "kill switch off (set GROKGW_DISABLED=1 or touch $STATE_DIR/disabled to block posting)"
+  fi
+
+  case "${GROKGW_MAX_PER_HOUR:-12}" in
+    ''|*[!0-9]*) pcheck FAIL "GROKGW_MAX_PER_HOUR must be a non-negative integer" ;;
+    *) pcheck INFO "cost guard: $(count_recent)/${GROKGW_MAX_PER_HOUR:-12} calls in the last hour" ;;
+  esac
+
   pcheck INFO "doctor spent no Bot usage; 'grokgw ping' does a real round trip (one Bot run)"
   return $DOCTOR_FAIL
 }
@@ -160,6 +236,7 @@ post() { # $1 = JSON body, $2 = op name; posts and classifies the outcome
   local hname="${GROKGW_AUTH_HEADER:-Authorization}" k code
   local tmo="${GROKGW_POST_TIMEOUT:-30}"
   case "$tmo" in ''|*[!0-9]*) die "GROKGW_POST_TIMEOUT must be seconds" ;; esac
+  guard || exit $?
   k=$(key) || exit 1
   [ -n "$k" ] || die "webhook key is empty"
   printf 'grokgw: request_id=%s (posting %s…)\n' "$RID" "$2" >&2
@@ -168,9 +245,9 @@ post() { # $1 = JSON body, $2 = op name; posts and classifies the outcome
           -X POST -H @- -H 'Content-Type: application/json' --data-binary "$1" "$GROKGW_WEBHOOK_URL" 2>/dev/null) || code=000  # quiet: curl errors can echo the URL
   unset k
   case "$code" in
-    2[0-9][0-9]) return 0 ;;
+    2[0-9][0-9]) record_call; return 0 ;;
     4[0-9][0-9]) die "webhook rejected the call (HTTP $code); no run started. Check URL/key, or whether the routine is paused." 2 ;;
-    *)           die "webhook outcome unknown (HTTP $code): the run may have started. request_id=$RID. Do not re-send blindly; try 'grokgw fetch $RID' later (if you have a return path) or check the gateway Bot's chat." 6 ;;
+    *)           record_call; die "webhook outcome unknown (HTTP $code): the run may have started. request_id=$RID. Do not re-send blindly; try 'grokgw fetch $RID' later (if you have a return path) or check the gateway Bot's chat." 6 ;;
   esac
 }
 
@@ -219,7 +296,7 @@ case "$CMD" in
   read)
     [ ${#ARGS[@]} -eq 1 ] || die "usage: grokgw read <agent> [--limit N] [--before N]"
     OP=read_transcript
-    BODY="{$base,\"op\":\"read_transcript\",\"agent\":$(jstr "${ARGS[0]}"),\"limit\":${LIMIT:-50}${BEFORE:+,\"before\":$BEFORE}}" ;;
+    BODY="{$base,\"op\":\"read_transcript\",\"agent\":$(jstr "${ARGS[0]}"),\"limit\":${LIMIT:-20}${BEFORE:+,\"before\":$BEFORE}}" ;;
   send)
     [ ${#ARGS[@]} -eq 2 ] || die "usage: grokgw send <agent> <message|-> [--priority] [--wait-reply]"
     OP=send_message
