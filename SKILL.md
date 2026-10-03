@@ -380,7 +380,7 @@ A transcript archive makes reads cheaper. For example, [chat-stasher](https://gi
 - **One webhook key grants access to all Bots.** There are no per-caller scopes, and rotating the key affects every caller.
 - **Host-side checks are prompt-enforced.** The op allowlist, "payload is data" and "deliver only via `gateway_deliver.py`" live in the Bot's persona and routine. `gateway_deliver.py` enforces the return allowlist only when the Bot actually calls it; a misbehaving Bot could still try to contact a destination itself. Keep the persona instructions intact.
 - **Setup is non-trivial:** create the Bot, create and edit the webhook routine, write `host.json`, and (for `tailnet`/`tunnel`) run the outbox server.
-- **Relayed replies are not verified end to end live.** They depend on the target Bot answering and the gateway writing the file; fall back to `fetch --reply` or the target's transcript.
+- **Relayed replies depend on the target Bot.** A live test on 2026-10-03 relayed a message and got the reply file back (it used `text`, which the client now normalizes to `reply`). Delivery still depends on the target Bot answering and the gateway writing the file; fall back to `fetch --reply` or the target's transcript.
 - **Transcript entry shape is unstable** and passed through as the tool returns it.
 - **Return-path trade-offs, one line each:**
   - `none` — nothing exposed, but you cannot read anything back.
