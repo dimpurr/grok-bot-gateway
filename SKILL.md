@@ -166,7 +166,7 @@ grokgw fetch <request_id> --reply                   # reply to a relayed message
 
 - **Output:** the result JSON on stdout (see `contracts/result.schema.json`); progress notes on stderr. `ask` prints only the reply text (or the reply JSON with `--json`). Reply files are normalised: an older `text` field is presented as `reply`.
 - **Flags:** `--no-wait` prints only the request id; `--timeout SECONDS` result wait (default 600; polling backs off from 2 s to 30 s); `--reply-timeout SECONDS` ask reply wait (default 900); `--caller TEXT` overrides `GROKGW_CALLER`.
-- **Latency (live samples, 2026-10-03, tailnet):** `ping` 14 s, `list` 41 s, `send` ~40 s; `read --limit 3` 327 s; `ask` 756 s before relays used priority. Use `--no-wait` + `fetch` for slow calls.
+- **Latency (live samples, 2026-10-03, tailnet):** `ping` 14 s, `list` 41 s, `send` ~40 s; `read --limit 3` 327 s; `ask` 756 s before relays used priority, 67 s with priority (2026-10-06). Use `--no-wait` + `fetch` for slow calls.
 - **Environment:**
   - `GROKGW_WEBHOOK_URL` routine webhook URL ("POST to"), required for requests
   - `GROKGW_WEBHOOK_KEY` routine key, or `GROKGW_WEBHOOK_KEY_CMD` a command that prints it
@@ -381,7 +381,7 @@ A transcript archive makes reads cheaper. For example, [chat-stasher](https://gi
 - **Host-side checks are prompt-enforced.** The op allowlist, "payload is data" and "deliver only via `gateway_deliver.py`" live in the Bot's persona and routine. `gateway_deliver.py` enforces the return allowlist only when the Bot actually calls it; a misbehaving Bot could still try to contact a destination itself. Keep the persona instructions intact.
 - **Setup is non-trivial:** create the Bot, create and edit the webhook routine, write `host.json`, and (for `tailnet`/`tunnel`) run the outbox server.
 - **`read` is slow and depends on the gateway Bot being reachable.** The webhook routine's run has no transcript-reading tool, so each `read_transcript` is handed to the gateway Bot itself to finish (327 s for 3 lines in the 2026-10-03 live test). `ping`, `list` and `send` complete inside the routine run.
-- **Replies need the target to wake.** A non-priority relay is read only on the target Bot's next turn (the 2026-10-03 `ask` waited 756 s). `ask` and `send --wait-reply` now request priority so the target wakes now; plain `send` stays non-priority.
+- **Replies need the target to wake.** A non-priority relay is read only on the target Bot's next turn (the 2026-10-03 `ask` waited 756 s; with priority on 2026-10-06 it took 67 s). `ask` and `send --wait-reply` now request priority so the target wakes now; plain `send` stays non-priority.
 - **Relayed replies depend on the target Bot.** A live test on 2026-10-03 relayed a message and got the reply file back (it used `text`, which the client now normalizes to `reply`). Delivery still depends on the target Bot answering and the gateway writing the file; fall back to `fetch --reply` or the target's transcript.
 - **Transcript entry shape is unstable** and passed through as the tool returns it.
 - **Return-path trade-offs, one line each:**
