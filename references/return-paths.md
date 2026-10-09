@@ -46,12 +46,28 @@ An absent `return` means an old v0.2 client; the host decides with
 ## `tailnet` — shared Tailscale tailnet
 
 - **Caller:** join the same tailnet as the gateway computer. Set
-  `GROKGW_RETURN=tailnet` and `GROKGW_OUTBOX=http://<gateway-host>:8787`
-  (a MagicDNS name or tailnet IP). Optional `GROKGW_OUTBOX_HOST` if a proxy in
+  `GROKGW_RETURN=tailnet` and `GROKGW_OUTBOX=http://<gateway-host>:8787`.
+  Prefer the gateway computer's MagicDNS name (`<name>.<tailnet>.ts.net`) over
+  its tailnet IP: the IP changes whenever the host re-registers. Optional `GROKGW_OUTBOX_HOST` if a proxy in
   front routes by host name.
 - **Host:** join the same tailnet and run `scripts/outbox_server.py` (via
   `scripts/start.sh`), which serves the outbox directory read-only.
   `gateway_deliver.py` writes the result files into that directory.
+- **Keep the host's tailnet identity across resets.** A Bot's computer can be
+  restarted, moved or reset; programs stop and only some directories survive
+  (on Grok Bot, the home directory and `/workspace` survived a reset that wiped
+  `/var/lib`). Tailscale's device identity lives in its state file, by default
+  under `/var/lib/tailscale`. If that file is lost the computer joins as a new
+  device with a new IP, and if the old offline device still holds the name the
+  new one gets a `-1` suffix. To avoid this:
+  - start `tailscaled` with `--statedir`/`--state` pointing into a directory
+    that survives (readable by root only);
+  - give the device a name you control (`tailscale set --hostname=<name>`);
+  - optionally disable key expiry for that device in the Tailscale admin
+    console;
+  - re-run `scripts/start.sh` (and `tailscaled`) after every restart, since
+    nothing on the Bot's computer autostarts. A scheduled routine that checks
+    the port and restarts it works well.
 - **host.json:**
   ```json
   {"allowed_returns": ["none", "tailnet"],

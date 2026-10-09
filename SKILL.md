@@ -390,3 +390,4 @@ A transcript archive makes reads cheaper. For example, [chat-stasher](https://gi
   - `callback` — results are pushed to the caller, who must run a public HTTPS receiver and handle per-request HMAC.
   - `tunnel` — works without a shared tailnet, but exposes the outbox on the public internet behind only a bearer token.
   - `tailnet` — no public exposure, but both sides must join one tailnet and shared devices can reach the port.
+- **The host's computer can restart or be reset.** Nothing autostarts there: after a restart the outbox server (and `tailscaled`) must be started again, and a reset can wipe Tailscale's state so the computer rejoins with a new IP and name. Callers should use a MagicDNS name, and hosts should keep Tailscale's state in a directory that survives; see the `tailnet` section of [references/return-paths.md](references/return-paths.md).

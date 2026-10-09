@@ -67,6 +67,7 @@ Create a gateway Bot and a webhook routine, copy the host scripts to its compute
 - The hourly cap applies only on each client machine. One webhook key grants access to every Bot and has no per-caller scopes.
 - Host-side operation and prompt-injection checks depend on the gateway Bot following its persona and routine instructions. The delivery script enforces the return allowlist when used, but a misbehaving Bot could try to contact a destination itself.
 - Setup requires creating the Bot and routine and configuring the host; `tailnet` and `tunnel` also require an outbox server.
+- The Bot's computer can restart or be reset, so the outbox server must be restarted afterwards; for `tailnet`, use a MagicDNS name and keep Tailscale's state in a directory that survives (see [return paths](references/return-paths.md)).
 - Relayed replies depend on the target Bot replying and the gateway writing the reply file; verified end to end once, and waits can still time out.
 - Transcript entry fields are passed through and may change.
 - Use through Cursor must follow Cursor's terms.
