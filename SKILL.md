@@ -8,6 +8,8 @@ metadata:
   version: "0.3.0"
 ---
 
+> **Canonical client for private fleets:** operators may keep an ops-tools copy of `grokgw` as the source of truth and treat this repository's `scripts/grokgw` as the shareable reference. Do not publish private hostnames, overlay IPs, private repo names, or secret environment variable names in this skill.
+
 # Grok Bot gateway
 
 An official-webhook-only gateway to all your Grok Bots: list them, read their transcripts and message them from outside Grok Bot. One dedicated **gateway Bot** has a routine with an official webhook trigger. An outside tool POSTs a small JSON request to that webhook, the gateway Bot wakes up, does one of four things (`ping`, list the Bots, read a Bot's transcript, send a Bot a message) and hands the result back over a **return path** the caller chose. Every request is a full Bot run, so it is asynchronous (tens of seconds to minutes) and spends the account's Grok Bot usage.
